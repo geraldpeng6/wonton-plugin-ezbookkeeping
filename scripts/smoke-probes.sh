@@ -163,11 +163,14 @@ mcp_check() { # 总线上有本插件的工具,并真调一次:总线的工具�
       [[ "$(jq -r '.confirmations | length' <<<"$cards" 2>/dev/null)" != 0 ]]; then
       while IFS= read -r id; do
         [[ -n "$id" ]] || continue
-        if reply="$(curl -sS --noproxy '*' --max-time 10 -X POST -H 'Content-Type: application/json' \
+        if reply="$(curl -sS --noproxy '*' --max-time 10 -X POST \
+          -H "Authorization: Bearer ${SMOKE_TOKEN}" -H 'Content-Type: application/json' \
           -d '{"answer":"approve"}' "${SMOKE_BASE}/_wonton/confirmations/$id")" &&
           grep -q '"success":true' <<<"$reply"; then
           approved=1
           jq -r --arg id "$id" '.confirmations[] | select(.id == $id) | "已替主人批准:\(.title)"' <<<"$cards"
+        else
+          echo "批准卡片 $id 没成功:$(head -c 120 <<<"$reply")" >&2
         fi
       done < <(jq -r '.confirmations[].id' <<<"$cards" 2>/dev/null)
     fi
