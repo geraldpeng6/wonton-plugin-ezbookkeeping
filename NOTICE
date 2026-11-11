@@ -1,7 +1,15 @@
 图标
 ====
 
-`icon.svg` 为本仓库原创，按插件规范的线条风格手写，未用图片模型生成。从模板新建的插件换成自己的图标时，这里按实际情况重写。
+`icon.png` 取自上游 ezBookkeeping 的应用图标 `public/img/ezbookkeeping-512.png`
+（https://github.com/mayswind/ezbookkeeping ，main 分支，2026-11-12 取），原样使用，
+仅按插件规范垫了纯白底（上游图标本身透明边）。
+
+ezBookkeeping 名称与标志是上游项目（MaysWind / ezBookkeeping）的商标；本插件与其无隶属或背书关系。
+
+上游代码与图标以 MIT 许可证发布（https://github.com/mayswind/ezbookkeeping/blob/main/LICENSE ）。
+
+`tabs/` 下的应用页面图标为本仓库原创，按插件规范的线条风格手写。
 
 许可证
 ------

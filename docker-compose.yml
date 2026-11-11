@@ -1,78 +1,140 @@
-# 示例插件：nginx 显示一个网页，向登录的人问好。改成自己的应用见 https://github.com/wontonapp/wonton-docs/blob/main/develop.md#写插件。
+# 家庭记账 ezBookkeeping：单容器，SQLite 和附件都在数据目录，不额外起数据库。
+#
+# 登录全走核心的 OIDC：关掉应用自己的密码登录（enable_internal_auth=false），登录页只剩
+# "使用云吞登录"一个按钮；首次 OIDC 登录自动建号（oauth2_auto_register，需要 enable_register=true），
+# 不能预建账号——已存在的账号首次 OIDC 登录要输账号密码才能绑定（上游的绑定确认页）。
+# webui.path 保持默认 /：/oauth2/login 的 client_session_id 是防重键，写死会让一次没走完的登录
+# 把 5 分钟内的所有登录都挡在门外（上游 duplicate checker，状态 300 秒过期）。
 services:
   web:
-    # 镜像按摘要固定（多架构镜像写清单列表的摘要），标签只给人看。
-    image: nginx:1.31.8-alpine@sha256:713fc2ebfd92e8217db451477182ee91944b123d2b1ee9fd5a8c6e91ca6c3a11
+    image: mayswind/ezbookkeeping:2.1.1@sha256:584e4d7f6fc1642773e840b56296f8782912e3bb17abfe3c49097508b198cdb7
+    # 上游镜像固定以 1000 运行，二进制可用任意 uid 跑；数据目录交给运行用户。
+    user: "${PUID}:${PGID}"
     environment:
-      # 网关代登录：SSI 回显的 Remote-User 只信核心带来的。官方镜像启动时对 templates 目录里的
-      # *.template 做 envsubst，把下面的地址换进 nginx 配置（见 web/default.conf.template）。
-      WONTON_CORE_ADDRESS: ${WONTON_CORE_ADDRESS}
-    # 包里的文件经 configs 交给容器（核心在启动前写进去），不能用卷挂载。
-    configs:
-      - source: site
-        target: /etc/nginx/templates/default.conf.template
-      - source: page
-        target: /usr/share/nginx/html/index.html
-      - source: tokens
-        target: /usr/share/nginx/html/tokens.css
+      TZ: ${TZ}
+      # 回调地址按它拼（RootUrl + oauth2/callback），和核心登记的回调路径保持一致。
+      EBK_SERVER_ROOT_URL: ${WONTON_APP_URL}/
+      # 日志只走 stdout，交给 Docker 收集；不写容器里的文件，免得重建后丢、不清理涨满。
+      EBK_LOG_MODE: console
+      # 令牌签名密钥由核心生成；重启后不变，会话才不失效。
+      EBK_SECURITY_SECRET_KEY: ${WONTON_SECRET_APP_SECRET_KEY}
+      # OIDC：客户端 id 就是插件 id，密钥由核心在安装时生成。
+      EBK_AUTH_ENABLE_OAUTH2_AUTH: "true"
+      EBK_AUTH_ENABLE_INTERNAL_AUTH: "false"
+      EBK_AUTH_OAUTH2_PROVIDER: oidc
+      EBK_AUTH_OAUTH2_CLIENT_ID: ${WONTON_APP_ID}
+      EBK_AUTH_OAUTH2_CLIENT_SECRET: ${WONTON_OIDC_CLIENT_SECRET}
+      EBK_AUTH_OIDC_PROVIDER_BASE_URL: ${WONTON_OIDC_ISSUER}
+      # 发现文档的 issuer 和这里不一致时登录会失败，校验保持打开（不跳过），错误更诚实。
+      EBK_AUTH_OAUTH2_AUTO_REGISTER: "true"
+      # 自动建号依赖自助注册开关，保持打开；登录页不显示注册入口（本地登录已关）。
+      EBK_USER_ENABLE_REGISTER: "true"
+      EBK_AUTH_ENABLE_OIDC_DISPLAY_NAME: "true"
+      EBK_AUTH_OIDC_CUSTOM_DISPLAY_NAME_ZH_HANS: 云吞
+      EBK_AUTH_OIDC_CUSTOM_DISPLAY_NAME_EN: Wonton
+      # MCP（Streamable HTTP）：总线带 MCP 令牌（主人在应用里生成后填到插件设置里）。
+      EBK_MCP_ENABLE_MCP: "true"
+      # 小票/文字识别走云吞的模型网关（OpenAI 兼容接口）；网关没接上时变量是空串，
+      # 空的环境值不覆盖 ini 默认（false），功能保持关闭。
+      EBK_AI_TRANSACTION_FROM_AI_TEXT_RECOGNITION: ${WONTON_MODEL_DEFAULT:+true}
+      EBK_AI_TRANSACTION_FROM_AI_IMAGE_RECOGNITION: ${WONTON_MODEL_DEFAULT:+true}
+      EBK_LLM_TEXT_RECOGNITION_LLM_PROVIDER: ${WONTON_MODEL_DEFAULT:+openai_compatible}
+      EBK_LLM_TEXT_RECOGNITION_OPENAI_COMPATIBLE_BASE_URL: ${WONTON_MODEL_BASE_URL}
+      EBK_LLM_TEXT_RECOGNITION_OPENAI_COMPATIBLE_API_KEY: ${WONTON_MODEL_API_KEY}
+      EBK_LLM_TEXT_RECOGNITION_OPENAI_COMPATIBLE_MODEL_ID: ${WONTON_MODEL_DEFAULT}
+      EBK_LLM_IMAGE_RECOGNITION_LLM_PROVIDER: ${WONTON_MODEL_DEFAULT:+openai_compatible}
+      EBK_LLM_IMAGE_RECOGNITION_OPENAI_COMPATIBLE_BASE_URL: ${WONTON_MODEL_BASE_URL}
+      EBK_LLM_IMAGE_RECOGNITION_OPENAI_COMPATIBLE_API_KEY: ${WONTON_MODEL_API_KEY}
+      EBK_LLM_IMAGE_RECOGNITION_OPENAI_COMPATIBLE_MODEL_ID: ${WONTON_MODEL_DEFAULT}
+    volumes:
+      # SQLite 库和附件分两个目录，卸载 --purge 删得干净。
+      - ${WONTON_APP_DATA}/data:/ezbookkeeping/data
+      - ${WONTON_APP_DATA}/storage:/ezbookkeeping/storage
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      # /healthz.json 不在鉴权之后，答出 status=ok 才算应用可用，不只是进程活着。
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz.json"]
       interval: 30s
       timeout: 5s
       start_period: 30s
       start_interval: 1s
 
-configs:
-  site:
-    file: web/default.conf.template
-  page:
-    file: web/index.html
-  tokens:
-    file: web/tokens.css
-
 x-wonton:
-  spec: "0.6"
-  # 换成你自己的：反向域名形式，装上以后不能改。
-  id: app.example.hello
-  version: 0.1.1
+  spec: "0.11"
+  id: net.mayswind.ezbookkeeping
+  version: 0.1.0
   kind: app
-  title: { zh: 你好, en: Hello }
-  description: { zh: 向登录的人问好的示例网页, en: An example page that greets whoever is signed in }
-  icon: icon.svg
+  title: { zh: 家庭记账（ezBookkeeping）, en: Home Bookkeeping (ezBookkeeping) }
+  description:
+    zh: 像随身的小账本，记下每天的花销和收入，还能导入支付宝、微信的账单
+    en: "A pocket ledger for daily spending and income, with Alipay and WeChat bill import"
+  icon: icon.png
   notices: [NOTICE]
   screenshots: [screenshots/home.png]
-  author: { name: Example }
-  homepage: https://nginx.org
-  # 应用（这里是 nginx）的许可证；插件包自己的许可证写在仓库的 LICENSE 里。
-  license: BSD-2-Clause
+  author: { name: geraldpeng6, url: https://github.com/geraldpeng6 }
+  homepage: https://ezbookkeeping.mayswind.net
+  license: MIT
   tags:
-    zh: [工具]
-    en: [Tools]
+    zh: [记账, 理财]
+    en: [Finance, Money]
   about:
     zh: |
-      一个示例网页：登录以后，页面会向你问好。新建插件时可以照着改。
+      记一笔只要几秒：选类别、输金额，花销收入一目了然。像百度网盘存照片一样，账目都在自己家里，不交给任何公司。
+
+      可以导入支付宝、微信导出的账单对账；拍下小票让助手识别金额和商家；家人各自记账，数据互相独立。
+
+      汇率换算和 AI 识别需要访问外网；模型网关没接上时，AI 识别在应用里如实显示不可用。
+
+      助手（Bot）也能帮你记账和查账：在应用的「设置 → 个人资料」设一个密码，再到「设置 → 安全」生成 MCP 令牌，
+      填到本插件的设置里即可，令牌长期有效。
     en: |
-      An example page: once you are signed in, the page says hello. Copy it as a starting point for a new plugin.
-  release_notes: { zh: 名字和说明更新。, en: Product name and description update. }
+      Record an expense in seconds: pick a category, type an amount, and see where the money goes. Like keeping photos in your own cloud, the books live at home, not with any company.
+
+      Import Alipay and WeChat statement exports to reconcile; snap a receipt and let the assistant read the amount and vendor. Each family member keeps their own books, independent of others.
+
+      Exchange rates and AI recognition need internet access; without a model gateway the AI features report as unavailable in the app.
+
+      The assistant (bot) can also record and look up transactions for you: set a password in the app under "Settings → Profile", generate an MCP token under "Settings → Security", and paste it into this plugin's settings. The token does not expire.
+  release_notes: { zh: 首个版本：ezBookkeeping 2.1.1，登录走云吞账号。, en: "Initial release: ezBookkeeping 2.1.1, signed in with your Wonton account." }
+  # 新用户默认货币是上游写死的美元（OIDC 建号没有货币声明可带），引导改成人民币。
+  setup:
+    zh: 打开应用，在「我的 → 个人资料」里把默认货币改成人民币。
+    en: Open the app and change the default currency to CNY under "Me → Profile".
   webui:
     service: web
-    port: 80
-    # 示例页回显网关注入的用户名，见 https://github.com/wontonapp/wonton-docs/blob/main/plugin-spec.md#网关代登录sso-proxy。
-    sso: proxy
-    proxy:
-      headers:
-        Remote-User: "{user}"
-  # 能放进侧边栏“我的应用”的页面，见 https://github.com/wontonapp/wonton-docs/blob/main/plugin-spec.md#应用页面tabs。放不放由用户决定。
+    port: 8080
+    sso: oidc
+    oidc:
+      redirect_paths: [/oauth2/callback]
   tabs:
-    - id: home
-      title: { zh: 主页, en: Home }
-      icon: tabs/home.svg
-      icon_selected: tabs/home-fill.svg
+    - id: ledger
+      title: { zh: 记账, en: Ledger }
+      icon: tabs/ledger.svg
+      icon_selected: tabs/ledger-fill.svg
       path: /
-      # 这个页面没做适配，用默认的 inset：从状态栏下沿开始，页面不用管安全区。
-      # 想让内容从状态栏后面滚过，写 layout: edge-to-edge，并用 --wonton-inset-* 留出系统安全区的位置。
-  permissions: []
-  # 上游 nginx 官方镜像，amd64 和 arm64 都有；上游没写最低内存，按本机空闲实测取整（实测约 24M，取 64M）。
+  mcp:
+    service: web
+    port: 8080
+    transport: streamable-http
+    # 上游的 MCP 只认它自己签发的用户令牌（生成要过账号密码确认，见 about）；令牌没填时
+    # 总线如实报凭据被拒，不影响应用本身。
+    headers:
+      Authorization: "Bearer {secret:mcp_token}"
+  secrets:
+    # 令牌签名密钥，由核心生成；重装保留数据时沿用，换掉会让所有登录失效。
+    app_secret_key:
+      generate: { bytes: 32 }
+    mcp_token:
+      input:
+        title: { zh: ezBookkeeping MCP 令牌, en: ezBookkeeping MCP token }
+        description:
+          zh: 在应用「设置 → 安全」生成 MCP 令牌后粘贴到这里（首次生成需先在「个人资料」设置密码）
+          en: Generate an MCP token in the app under "Settings → Security" and paste it here (set a password under "Profile" first)
+        required: false
+  permissions:
+    # 汇率数据源（欧洲央行）在应用里拉取，要出网；AI 识别经模型网关（内部地址，不走代理）。
+    - network.egress
+    - models
+  # 上游没写最低内存；本机空闲实测后取整（见 PR 验证）。镜像有 amd64 和 arm64。
   requirements:
     arch: [amd64, arm64]
-    memory: 64M
+    memory: 128M
