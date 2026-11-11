@@ -1,10 +1,9 @@
 # 家庭记账 ezBookkeeping：单容器，SQLite 和附件都在数据目录，不额外起数据库。
 #
-# 登录全走核心的 OIDC：关掉应用自己的密码登录（enable_internal_auth=false），登录页只剩
-# "使用云吞登录"一个按钮；首次 OIDC 登录自动建号（oauth2_auto_register，需要 enable_register=true），
-# 不能预建账号——已存在的账号首次 OIDC 登录要输账号密码才能绑定（上游的绑定确认页）。
-# webui.path 保持默认 /：/oauth2/login 的 client_session_id 是防重键，写死会让一次没走完的登录
-# 把 5 分钟内的所有登录都挡在门外（上游 duplicate checker，状态 300 秒过期）。
+# 登录用应用自己的账号密码（sso: none），不接核心的 OIDC：上游的 MCP 令牌签发强制过账号密码确认，
+# 而 OIDC 自动建号的账号没有密码，装好时给不出 MCP 令牌（核心要求 mcp.headers 引用的密钥在安装时就有值）。
+# 规范对 sso:oidc 的要求是"不用脚本预建账号、打开不再看到登录页"，做不到时写明原因退到 none——
+# 详见 README 的"登录"一节和 PR 里的取舍。
 services:
   web:
     image: mayswind/ezbookkeeping:2.1.1@sha256:584e4d7f6fc1642773e840b56296f8782912e3bb17abfe3c49097508b198cdb7
@@ -12,27 +11,14 @@ services:
     user: "${PUID}:${PGID}"
     environment:
       TZ: ${TZ}
-      # 回调地址按它拼（RootUrl + oauth2/callback），和核心登记的回调路径保持一致。
+      # 回调地址、MCP 地址展示都按它拼。
       EBK_SERVER_ROOT_URL: ${WONTON_APP_URL}/
       # 日志只走 stdout，交给 Docker 收集；不写容器里的文件，免得重建后丢、不清理涨满。
       EBK_LOG_MODE: console
       # 令牌签名密钥由核心生成；重启后不变，会话才不失效。
       EBK_SECURITY_SECRET_KEY: ${WONTON_SECRET_APP_SECRET_KEY}
-      # OIDC：客户端 id 就是插件 id，密钥由核心在安装时生成。
-      EBK_AUTH_ENABLE_OAUTH2_AUTH: "true"
-      EBK_AUTH_ENABLE_INTERNAL_AUTH: "false"
-      EBK_AUTH_OAUTH2_PROVIDER: oidc
-      EBK_AUTH_OAUTH2_CLIENT_ID: ${WONTON_APP_ID}
-      EBK_AUTH_OAUTH2_CLIENT_SECRET: ${WONTON_OIDC_CLIENT_SECRET}
-      EBK_AUTH_OIDC_PROVIDER_BASE_URL: ${WONTON_OIDC_ISSUER}
-      # 发现文档的 issuer 和这里不一致时登录会失败，校验保持打开（不跳过），错误更诚实。
-      EBK_AUTH_OAUTH2_AUTO_REGISTER: "true"
-      # 自动建号依赖自助注册开关，保持打开；登录页不显示注册入口（本地登录已关）。
-      EBK_USER_ENABLE_REGISTER: "true"
-      EBK_AUTH_ENABLE_OIDC_DISPLAY_NAME: "true"
-      EBK_AUTH_OIDC_CUSTOM_DISPLAY_NAME_ZH_HANS: 云吞
-      EBK_AUTH_OIDC_CUSTOM_DISPLAY_NAME_EN: Wonton
-      # MCP（Streamable HTTP）：总线带 MCP 令牌（主人在应用里生成后填到插件设置里）。
+      # 本地密码登录和自助注册都是上游默认（打开）：主人用预建账号登录，家人自己注册各自的账本。
+      # MCP（Streamable HTTP）：总线带 MCP 令牌（init 在装好时签发，主人在应用里吊销后重建容器会重签）。
       EBK_MCP_ENABLE_MCP: "true"
       # 小票/文字识别走云吞的模型网关（OpenAI 兼容接口）；网关没接上时变量是空串，
       # 空的环境值不覆盖 ini 默认（false），功能保持关闭。
@@ -58,8 +44,32 @@ services:
       start_period: 30s
       start_interval: 1s
 
+  # 一次性服务：给主人建账号（用户名/邮箱用核心注入的，和云吞一致；中文、人民币）
+  # 并给 MCP 入口签发用户令牌，令牌交给核心保管（见 secrets.mcp_token）。幂等：令牌还在就直接收工。
+  init:
+    image: curlimages/curl:8.17.0@sha256:935d9100e9ba842cdb060de42472c7ca90cfe9a7c96e4dacb55e79e560b3ff40
+    user: "${PUID}:${PGID}"
+    entrypoint: ["/bin/sh", "/init.sh"]
+    environment:
+      WONTON_OWNER_NAME: ${WONTON_OWNER_NAME}
+      WONTON_OWNER_EMAIL: ${WONTON_OWNER_EMAIL}
+      WONTON_SECRET_OWNER_PASSWORD: ${WONTON_SECRET_OWNER_PASSWORD}
+    volumes:
+      - ${WONTON_APP_DATA}/mcp:/ebk-bridge
+    configs:
+      - source: init
+        target: /init.sh
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: "no"
+
+configs:
+  init:
+    file: config/init.sh
+
 x-wonton:
-  spec: "0.11"
+  spec: "0.12"
   id: net.mayswind.ezbookkeeping
   version: 0.1.0
   kind: app
@@ -80,31 +90,32 @@ x-wonton:
     zh: |
       记一笔只要几秒：选类别、输金额，花销收入一目了然。像百度网盘存照片一样，账目都在自己家里，不交给任何公司。
 
-      可以导入支付宝、微信导出的账单对账；拍下小票让助手识别金额和商家；家人各自记账，数据互相独立。
+      可以导入支付宝、微信导出的账单对账；拍下小票让助手识别金额和商家。家人各自注册各自的账本，数据互相独立。
+
+      打开应用用云吞的用户名登录，初始密码在插件设置里能查看，登录后可以改成自己的。你的账本默认就是中文和人民币。
+
+      助手（Bot）装好就能帮你记账和查账，看到的是你的账本；在应用里吊销 MCP 令牌后，重建容器时会自动重新签发。
 
       汇率换算和 AI 识别需要访问外网；模型网关没接上时，AI 识别在应用里如实显示不可用。
-
-      助手（Bot）也能帮你记账和查账：在应用的「设置 → 个人资料」设一个密码，再到「设置 → 安全」生成 MCP 令牌，
-      填到本插件的设置里即可，令牌长期有效。
     en: |
       Record an expense in seconds: pick a category, type an amount, and see where the money goes. Like keeping photos in your own cloud, the books live at home, not with any company.
 
-      Import Alipay and WeChat statement exports to reconcile; snap a receipt and let the assistant read the amount and vendor. Each family member keeps their own books, independent of others.
+      Import Alipay and WeChat statement exports to reconcile; snap a receipt and let the assistant read the amount and vendor. Each family member registers their own books, independent of others.
+
+      Sign in with your Wonton username; the initial password is in this plugin's settings and can be changed after signing in. Your books start in Chinese with CNY as the default currency.
+
+      The assistant (bot) can record and look up transactions for you right after install, seeing your books; if you revoke the MCP token in the app, a container rebuild re-issues it.
 
       Exchange rates and AI recognition need internet access; without a model gateway the AI features report as unavailable in the app.
-
-      The assistant (bot) can also record and look up transactions for you: set a password in the app under "Settings → Profile", generate an MCP token under "Settings → Security", and paste it into this plugin's settings. The token does not expire.
-  release_notes: { zh: 首个版本：ezBookkeeping 2.1.1，登录走云吞账号。, en: "Initial release: ezBookkeeping 2.1.1, signed in with your Wonton account." }
-  # 新用户默认货币是上游写死的美元（OIDC 建号没有货币声明可带），引导改成人民币。
+  release_notes: { zh: 首个版本：ezBookkeeping 2.1.1。, en: "Initial release: ezBookkeeping 2.1.1." }
+  # 主人的账号是装好时按云吞用户名预建的（登录方式见 about）；初始密码在这里查看。
   setup:
-    zh: 打开应用，在「我的 → 个人资料」里把默认货币改成人民币。
-    en: Open the app and change the default currency to CNY under "Me → Profile".
+    zh: 打开应用，用云吞的用户名登录；初始密码在插件设置里查看。
+    en: Open the app and sign in with your Wonton username; the initial password is in the plugin settings.
   webui:
     service: web
     port: 8080
-    sso: oidc
-    oidc:
-      redirect_paths: [/oauth2/callback]
+    sso: none
   tabs:
     - id: ledger
       title: { zh: 记账, en: Ledger }
@@ -115,22 +126,23 @@ x-wonton:
     service: web
     port: 8080
     transport: streamable-http
-    # 上游的 MCP 只认它自己签发的用户令牌（生成要过账号密码确认，见 about）；令牌没填时
-    # 总线如实报凭据被拒，不影响应用本身。
+    # 上游的 MCP 只认它自己签发的用户令牌；init 在装好时签发，核心从这里收存并带给总线。
     headers:
       Authorization: "Bearer {secret:mcp_token}"
   secrets:
     # 令牌签名密钥，由核心生成；重装保留数据时沿用，换掉会让所有登录失效。
     app_secret_key:
       generate: { bytes: 32 }
+    # 主人的初始密码：装好时建账号用，主人在插件设置里查看后登录应用。
+    owner_password:
+      generate: { bytes: 32 }
+      show_owner: { label: { zh: 初始密码, en: Initial password, zh-Hant: 初始密碼, ja: 初期パスワード } }
+    # MCP 令牌：init 签发后写进数据目录，核心从这里收存；吊销后重建容器时重签。
     mcp_token:
-      input:
-        title: { zh: ezBookkeeping MCP 令牌, en: ezBookkeeping MCP token }
-        description:
-          zh: 在应用「设置 → 安全」生成 MCP 令牌后粘贴到这里（首次生成需先在「个人资料」设置密码）
-          en: Generate an MCP token in the app under "Settings → Security" and paste it here (set a password under "Profile" first)
-        required: false
+      collect: { service: init, path: /ebk-bridge/token }
   permissions:
+    # init 要知道主人的用户名和邮箱来建账号。
+    - owner.identity
     # 汇率数据源（欧洲央行）在应用里拉取，要出网；AI 识别经模型网关（内部地址，不走代理）。
     - network.egress
     - models

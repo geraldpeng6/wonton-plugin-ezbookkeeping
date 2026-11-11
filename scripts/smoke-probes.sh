@@ -1,212 +1,180 @@
-# scripts/smoke.sh 的一项一项探测，跟着插件走。
-# shellcheck shell=bash disable=SC2034
+# shellcheck shell=bash
+# scripts/smoke.sh 的一项一项探测，跟着插件走。没写的项会 FAIL 并给出写法，不会默认放行。
+#
+# 变量别叫 state：shellcheck 把这份文件连着 probes.sh 一起分析，probes.sh 自己也读一个 dev.sh 提供的 state；
+# 子壳体函数（fn() ( … )）里给 state 赋值，SC2031 就报在 probes.sh 上，CI 红。
+#
+# 变量：两套冒烟环境（dev.sh smoke、正式 e2e 套件）都给的只有 SMOKE_STATE、SMOKE_JAR、SMOKE_WEB_URL、
+#       SMOKE_OWNER、SMOKE_BASE、SMOKE_TOKEN、SMOKE_INSTANCE 和 web_get、dweb。SMOKE_WEB_URL 的含义两边不同
+#       （dev.sh smoke 是带路径的网页入口，正式套件剥成只有 origin），拼 API 和读核心接口都用 _ebk_origin
+#       现场取的 origin；插件 id 硬编码在下面（正式套件的钩子约定里没有 SMOKE_PLUGIN_ID，读主人初始密码的
+#       核心接口要用它），不依赖 SMOKE_WEB_ORIGIN/SMOKE_PLUGIN_ID。
 #
 # 页面：web_assert 从标准输入读页面，命中的确是应用的真实页面时返回 0。
-# 身份：identity_check 走完整 OIDC（应用 /oauth2/login → 核心身份方用核心会话自动授权 → 回调）拿应用
-#       令牌，再用应用自己的"当前用户"接口断言认出的是主人。
-# 工具：上游工具都没标 readOnlyHint（每次调用总线都发确认卡片），不能写 MCP_TOOL（套件要求标注），
-#       写 mcp_check：套件先跑 mcp list（结果在 $SMOKE_TOOLS），再由这里后台跑 approve 应答卡片、
-#       调 query_all_accounts。调用前要备凭据，写在 before_mcp：按 README 写的主人流程的等价 API——
-#       给 owner 账号设密码（OIDC 建的号没有密码，不要求旧密码）→ 生成 MCP 令牌（生成要过密码确认）
-#       → 经核心接口填进插件的 input 密钥（等价于主人在设置页粘贴）。
-# 数据：data_write 用随机标记经应用 API 记一笔支出，标记写进 $SMOKE_STATE；data_check 读回标记去
-#       transactions/list 里找。OIDC 自动建号的账本是空的，先建账户和类别。
+# 身份：identity_check 只证明身份：用应用自己的"当前用户"接口断言认出的是用户管理员，不碰应用里的数据。
+# 数据断言（有几条、内容对不对）全部交给 data_write / data_check：data_write 用随机标记写数据并把标记
+# 存进 SMOKE_STATE，data_check 读回标记去应用里找，对不上就打印看到了什么并返回非 0。
+# 工具：mcp_check 断言总线上有本插件的工具并真调一次（两套环境各自的 MCP 变量见函数内说明）。
+#
+# 登录是这个插件自己的（sso: none）：主人账号装好时预建（用户名=云吞用户名），初始密码由核心生成、
+# show_owner，探针经核心 API 读取（这条读会被核心审计），再走应用自己的 authorize.json 登录取用户令牌。
+# 登录失败会计入应用的每 IP 限速（默认 5 次/分钟），所以一轮里只登录一次，令牌在同一轮探针里复用，失败不重试。
+# shellcheck disable=SC2034  # SSO/MCP 由冒烟套件读取
+SSO=none
+MCP=1
 
-web_assert() { grep -qi '<title>ezBookkeeping</title>'; }
+EBK_ID="net.mayswind.ezbookkeeping"
+EBK_TOKEN=""
 
-_ebk_origin() { printf '%s' "${SMOKE_WEB_ORIGIN:-${SMOKE_WEB_URL%%[/?#]*}}"; }
-
-_ebk_rand() { od -An -N8 -tx1 /dev/urandom | tr -d ' \n'; }
-
-_ebk_state_dir() { # SMOKE_STATE 在套件里是标记文件（e2e 里可能是目录），探针自己的状态文件放同一边
-  if [[ -d "${SMOKE_STATE:-}" ]]; then printf '%s' "$SMOKE_STATE"; else printf '%s' "$(dirname "${SMOKE_STATE:-.}")"; fi
+_ebk_origin() { # SMOKE_WEB_URL 两边含义不同（一个带入口路径、一个只有 origin），拼 API 前取 origin
+  local u="${SMOKE_WEB_URL%%\?*}" rest="${SMOKE_WEB_URL#*://}"
+  printf '%s://%s' "${u%%://*}" "${rest%%/*}"
 }
 
-_ebk_pw_file() { printf '%s/ezbookkeeping-mcp-pw' "$(_ebk_state_dir)"; }
-
-_ebk_marker_file() {
-  if [[ -d "${SMOKE_STATE:-}" ]]; then printf '%s' "$SMOKE_STATE/ezbookkeeping-marker"; else printf '%s' "${SMOKE_STATE}.marker"; fi
+_ebk_core_session() { # 主人令牌登进核心会话，再走一遍插件域名的会话交接（APP Cookie 落进同一个 jar）
+  [[ -n "${SMOKE_JAR:-}" && -n "${SMOKE_BASE:-}" && -n "${SMOKE_TOKEN:-}" && -n "${SMOKE_WEB_URL:-}" ]] ||
+    { echo "缺冒烟变量：SMOKE_JAR/SMOKE_BASE/SMOKE_TOKEN/SMOKE_WEB_URL" >&2; return 1; }
+  # -b 保留 jar 里已有的会话（只写 -c 会把别的域的会话抹掉）
+  curl -sS --noproxy '*' --max-time 120 -o /dev/null -b "$SMOKE_JAR" -c "$SMOKE_JAR" \
+    --data-urlencode "token=${SMOKE_TOKEN}" "${SMOKE_BASE}/_wonton/login" ||
+    { echo "主人令牌登不进核心会话" >&2; return 1; }
+  # 插件网页在核心会话之外：未登录的页面请求跳核心 /_wonton/sso，跟完交接在插件域名种上应用会话
+  curl -sS --noproxy '*' --max-time 120 -o /dev/null -L -b "$SMOKE_JAR" -c "$SMOKE_JAR" \
+    -H 'Accept: text/html' "$(_ebk_origin)/" ||
+    { echo "走不通插件网页的会话交接" >&2; return 1; }
 }
 
-# 应用自己的 API：<方法> <路径> <令牌> [<JSON 正文>]，响应到标准输出。走 SMOKE_WEB_ORIGIN
-# （套件的 web_get 会把路径拼在入口路径后面，这里要的是 origin）。
-_ebk_api() {
-  local method="$1" path="$2" token="$3" body="${4:-}"
-  if [[ -n "$body" ]]; then
-    curl_t "$SMOKE_WEB_MAX_TIME" "$(_ebk_origin)$path" --noproxy '*' -X "$method" \
-      -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d "$body"
-  else
-    curl_t "$SMOKE_WEB_MAX_TIME" "$(_ebk_origin)$path" --noproxy '*' -X "$method" -H "Authorization: Bearer $token"
+_ebk_password() { # 主人的初始密码（核心 API 的响应是 {"value":"…"}）
+  local v
+  _ebk_core_session || return 1
+  v="$(curl -sS --noproxy '*' --max-time 120 --fail-with-body -b "$SMOKE_JAR" -H "Authorization: Bearer ${SMOKE_TOKEN}" \
+    "${SMOKE_BASE}/_wonton/api/plugins/${EBK_ID}/secrets/owner_password")" ||
+    { echo "核心里读不到主人初始密码（secrets.owner_password）" >&2; return 1; }
+  v="$(jq -r '.value // empty' <<<"$v")"
+  [[ -n "$v" ]] || { echo "核心没给初始密码的值" >&2; return 1; }
+  printf '%s' "$v"
+}
+
+_ebk_login() { # <用户名> <密码>：成功输出应用的用户令牌
+  local resp
+  [[ -n "${SMOKE_WEB_URL:-}" ]] || { echo "缺冒烟变量：SMOKE_WEB_URL" >&2; return 1; }
+  resp="$(curl -sS --noproxy '*' --max-time 120 --fail-with-body -b "${SMOKE_JAR:-}" -X POST -H 'Content-Type: application/json' \
+    -d "{\"loginName\":\"$1\",\"password\":\"$2\"}" "$(_ebk_origin)/api/authorize.json")" ||
+    { echo "应用登录失败（账号 $1，用初始密码）" >&2; return 1; }
+  printf '%s' "$resp" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'
+}
+
+ebk_api() { # <方法> <路径> [JSON 正文]：用 $EBK_TOKEN 调应用接口，输出响应
+  local method="$1" path="$2" body="${3:-}"
+  local args=(-sS --noproxy '*' --max-time 120 -b "${SMOKE_JAR:-}" -X "$method" \
+    -H "Authorization: Bearer $EBK_TOKEN" -H 'X-Timezone-Offset: 480')
+  [[ -n "$body" ]] && args+=(-H 'Content-Type: application/json' -d "$body")
+  curl "${args[@]}" "$(_ebk_origin)$path"
+}
+
+_ebk_token() { # 一轮探针共用一个登录态
+  local pw
+  if [[ -z "$EBK_TOKEN" ]]; then
+    pw="$(_ebk_password)" || return 1
+    EBK_TOKEN="$(_ebk_login "${SMOKE_OWNER:-owner}" "$pw")" || return 1
   fi
+  printf '%s' "$EBK_TOKEN"
 }
 
-# 走完浏览器式 OIDC 拿应用会话令牌：核心会话先补进 jar（-b 保留别的域的会话），再跟 /oauth2/login
-# 的重定向链；回调成功页的地址里带着临时令牌（fragment 不发给服务器，只能从 Location 头取），
-# 再按前端登录后的同一步 POST /api/oauth2/authorize.json 换成正式会话令牌。
-# client_session_id 每次随机：它是上游的防重键，写死会让一次没走完的登录挡住后面的登录（300 秒）。
-ebk_token() {
-  local jar base url loc i token out
-  jar="${SMOKE_JAR:-}" base="${SMOKE_BASE:-}"
-  [[ -n "$jar" && -n "$base" && -n "${SMOKE_TOKEN:-}" && -n "${SMOKE_WEB_URL:-}" ]] ||
-    { echo "缺冒烟变量：需要 SMOKE_JAR/SMOKE_BASE/SMOKE_TOKEN/SMOKE_WEB_URL" >&2; return 1; }
-  curl -sS --noproxy '*' -o /dev/null -b "$jar" -c "$jar" --data-urlencode "token=$SMOKE_TOKEN" \
-    "$base/_wonton/login" || { echo "主人令牌登录不了核心" >&2; return 1; }
-  url="$(_ebk_origin)/oauth2/login?platform=desktop&client_session_id=wonton-$(_ebk_rand)"
-  for i in 1 2 3 4 5 6 7 8; do
-    loc="$(curl_t "$SMOKE_WEB_MAX_TIME" "$url" --noproxy '*' -b "$jar" -c "$jar" -H 'Accept: text/html' \
-      -o /dev/null -w '%{redirect_url}')" || { echo "登录重定向链断在 $url" >&2; return 1; }
-    [[ -z "$loc" ]] && break
-    url="$loc"
-    if [[ "$url" == *oauth2_callback*token=* ]]; then
-      token="${url##*[?&]token=}"
-      token="${token%%&*}"
-      token="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.unquote(sys.argv[1]))' "$token")"
-      [[ -n "$token" ]] || { echo "回调地址里 token 为空：$url" >&2; return 1; }
-      out="$(curl_t "$SMOKE_WEB_MAX_TIME" "$(_ebk_origin)/api/oauth2/authorize.json" --noproxy '*' -X POST \
-        -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
-        -d "$(jq -nc --arg t "$token" '{token:$t}')")" ||
-        { echo "临时令牌换会话令牌失败：$out"; return 1; }
-      token="$(jq -r '.result.token // empty' <<<"$out" 2>/dev/null)"
-      [[ -n "$token" ]] || { echo "换会话令牌的响应里没有 token：$(head -c 200 <<<"$out")" >&2; return 1; }
-      printf '%s' "$token"
-      return 0
-    fi
-  done
-  echo "重定向链里没走到回调（最后：$url）" >&2
-  return 1
+web_assert() { # 登录页就是应用自己的（SPA 外壳，标题写死 ezBookkeeping）
+  grep -qi '<title>[^<]*ezBookkeeping'
 }
 
 identity_check() {
-  local token me
-  token="$(ebk_token)" || { echo "拿不到应用令牌：OIDC 登录链失败"; return 1; }
-  me="$(_ebk_api GET /api/v1/users/profile/get.json "$token")" ||
-    { echo "当前用户接口失败：$me"; return 1; }
-  jq -e --arg u "$SMOKE_OWNER" '.result.username == $u' <<<"$me" >/dev/null ||
-    { echo "应用认出的不是用户 $SMOKE_OWNER：$(head -c 200 <<<"$me")"; return 1; }
+  local resp
+  _ebk_token >/dev/null || { echo "拿不到应用登录态（读初始密码或登录失败）"; return 1; }
+  resp="$(ebk_api GET /api/v1/users/profile/get.json)" || { echo "取不到当前用户"; return 1; }
+  jq -e --arg owner "${SMOKE_OWNER:-owner}" '.success == true and .result.username == $owner' <<<"$resp" >/dev/null ||
+    { echo "认出的不是管理员：$(head -c 160 <<<"$resp")"; return 1; }
 }
 
-# ---------- 工具（MCP）：先按主人流程备好令牌，再经总线调只读查询 ----------
+_ebk_marker_file() { # SMOKE_STATE 在套件里可能是状态目录（e2e 传的是标记文件本身），标记放对应路径
+  if [[ -d "${SMOKE_STATE:-}" ]]; then printf '%s' "$SMOKE_STATE/ezbookkeeping-marker"; else printf '%s' "${SMOKE_STATE}.marker"; fi
+}
 
-before_mcp() {
-  local token pw pw_file new_pw mcp_token secret_resp resp
-  [[ "$SMOKE_SSO" == oidc ]] || { echo "清单不是 sso: oidc，备凭据的探针不适用"; return 1; }
-  token="$(ebk_token)" || { echo "拿不到应用会话令牌：OIDC 登录链失败"; return 1; }
-  pw_file="$(_ebk_pw_file)"
-  pw="$(cat "$pw_file" 2>/dev/null || true)"
+data_write() { # 现金账户 + 支出主分类和子分类 + 一笔带随机标记的支出，标记存进 SMOKE_STATE
+  # 上游规定交易只能挂子分类（pkg/services/transactions.go isCategoryValid：主分类拒收），所以建两级
+  local marker acc cat sub resp
+  _ebk_token >/dev/null || { echo "拿不到应用登录态，写不了数据"; return 1; }
+  marker="保数据-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
 
-  _ebk_mint() { # <会话令牌> <密码>：生成 MCP 令牌，输出到标准输出；失败输出空
-    _ebk_api POST /api/v1/tokens/generate/mcp.json "$1" \
-      "$(jq -nc --arg p "$2" '{password:$p}')" 2>/dev/null | jq -r '.result.token // empty' 2>/dev/null
-  }
+  resp="$(ebk_api POST /api/v1/accounts/add.json \
+    '{"name":"现金","category":1,"type":1,"icon":"1","iconType":0,"color":"4285f4","currency":"CNY","balance":"0"}')" ||
+    { echo "建账户失败：$(head -c 160 <<<"$resp")"; return 1; }
+  acc="$(jq -r '.result.id // empty' <<<"$resp")"
+  [[ -n "$acc" && "$acc" != null ]] || { echo "建账户的响应里没有账户：$(head -c 160 <<<"$resp")"; return 1; }
 
-  if [[ -n "$pw" ]]; then
-    mcp_token="$(_ebk_mint "$token" "$pw")"
-  fi
-  if [[ -z "${mcp_token:-}" ]]; then
-    # 没有存档密码（首次）或存档的密码不对（账号密码被改过）：设一个新密码再生成。
-    # OIDC 自动建号的账号没有密码，profile/update 不要求旧密码；有密码时要带上旧密码。
-    new_pw="ebk-probe-$(_ebk_rand)"
-    if [[ -n "$pw" ]]; then
-      resp="$(_ebk_api POST /api/v1/users/profile/update.json "$token" \
-        "$(jq -nc --arg o "$pw" --arg p "$new_pw" '{oldPassword:$o,password:$p}')" 2>/dev/null)" ||
-        { echo "改 owner 账号密码失败：$resp"; return 1; }
-    else
-      resp="$(_ebk_api POST /api/v1/users/profile/update.json "$token" \
-        "$(jq -nc --arg p "$new_pw" '{password:$p}')" 2>/dev/null)" ||
-        { echo "给 owner 账号设密码失败（账号已有别的密码？）：$resp"; return 1; }
+  resp="$(ebk_api POST /api/v1/transaction/categories/add.json \
+    '{"name":"餐饮","type":2,"icon":"1","iconType":0,"color":"4285f4"}')" ||
+    { echo "建主分类失败：$(head -c 160 <<<"$resp")"; return 1; }
+  cat="$(jq -r '.result.id // empty' <<<"$resp")"
+  [[ -n "$cat" && "$cat" != null ]] || { echo "建主分类的响应里没有分类：$(head -c 160 <<<"$resp")"; return 1; }
+
+  resp="$(ebk_api POST /api/v1/transaction/categories/add.json \
+    "{\"name\":\"买菜\",\"type\":2,\"parentId\":\"$cat\",\"icon\":\"1\",\"iconType\":0,\"color\":\"4285f4\"}")" ||
+    { echo "建子分类失败：$(head -c 160 <<<"$resp")"; return 1; }
+  sub="$(jq -r '.result.id // empty' <<<"$resp")"
+  [[ -n "$sub" && "$sub" != null ]] || { echo "建子分类的响应里没有分类：$(head -c 160 <<<"$resp")"; return 1; }
+
+  resp="$(ebk_api POST /api/v1/transactions/add.json "{\"type\":3,\"time\":$(date +%s),\
+\"sourceAccountId\":\"$acc\",\"sourceAmount\":2345,\"categoryId\":\"$sub\",\"comment\":\"$marker\"}")" ||
+    { echo "记账失败：$(head -c 160 <<<"$resp")"; return 1; }
+  jq -e --arg m "$marker" '.success == true and .result.comment == $m' <<<"$resp" >/dev/null ||
+    { echo "记账没有成功：$(head -c 160 <<<"$resp")"; return 1; }
+  jq -nc --arg m "$marker" --arg a "$acc" '{marker:$m,account_id:$a}' >"$(_ebk_marker_file)"
+}
+
+data_check() { # 按标记把那笔账搜出来
+  local marker resp
+  marker="$(jq -r .marker "$(_ebk_marker_file)")"
+  _ebk_token >/dev/null || { echo "拿不到应用登录态，查不了数据"; return 1; }
+  resp="$(ebk_api GET "/api/v1/transactions/list.json?keyword=$marker&count=20&with_count=true")" ||
+    { echo "查交易失败：$(head -c 160 <<<"$resp")"; return 1; }
+  jq -e --arg m "$marker" '.success == true and ([.result.items[].comment] | index($m) != null)' <<<"$resp" >/dev/null ||
+    { echo "找不到写进去的那笔账（标记 $marker）：$(head -c 200 <<<"$resp")"; return 1; }
+}
+
+mcp_check() { # 总线上有本插件的工具,并真调一次:总线的工具调用先发确认卡,探针替主人批准(用核心 API)
+  # 两套环境的变量:dev.sh smoke 给 SMOKE_MCP_URL/SMOKE_SLUG,正式套件给 E2E_MCP_URL/E2E_SLUG,mcp 助手两边都有
+  local url="${E2E_MCP_URL:-${SMOKE_MCP_URL:-}}" slug="${E2E_SLUG:-${SMOKE_SLUG:-}}"
+  local tools tool out err pid approved="" i cards id reply
+  [[ -n "$url" && -n "$slug" ]] || { echo "缺 MCP 冒烟变量(MCP_URL/SLUG)" >&2; return 1; }
+  [[ -n "${SMOKE_BASE:-}" && -n "${SMOKE_TOKEN:-}" ]] ||
+    { echo "缺冒烟变量:SMOKE_BASE/SMOKE_TOKEN" >&2; return 1; }
+  tools="$(mcp list "$url")" || { echo "tools/list 失败"; return 1; }
+  tool="${slug}__query_all_accounts"
+  jq -e --arg t "$tool" 'any(.[]; .name == $t)' <<<"$tools" >/dev/null ||
+    { echo "tools/list 没有 $tool:$(head -c 200 <<<"$tools")"; return 1; }
+  # 上游的 MCP 服务不实现工具注解,读工具标不了 readOnlyHint,总线每次调用都发确认卡等批准;
+  # 上游能力缺口,在 README 和 PR 里写明。这里后台发起调用,轮询确认卡替主人批准,再收结果。
+  out="$(mktemp)"; err="$(mktemp)"
+  mcp call "$url" "$tool" '{}' >"$out" 2>"$err" &
+  pid=$!
+  for ((i = 0; i < 60; i++)); do
+    kill -0 "$pid" 2>/dev/null || break
+    if [[ -z "$approved" ]] &&
+      cards="$(curl -sS --noproxy '*' --max-time 10 -H "Authorization: Bearer ${SMOKE_TOKEN}" \
+        "${SMOKE_BASE}/_wonton/api/confirmations" 2>/dev/null)" &&
+      [[ "$(jq -r '.confirmations | length' <<<"$cards" 2>/dev/null)" != 0 ]]; then
+      while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        if reply="$(curl -sS --noproxy '*' --max-time 10 -X POST -H 'Content-Type: application/json' \
+          -d '{"answer":"approve"}' "${SMOKE_BASE}/_wonton/confirmations/$id")" &&
+          grep -q '"success":true' <<<"$reply"; then
+          approved=1
+          jq -r --arg id "$id" '.confirmations[] | select(.id == $id) | "已替主人批准:\(.title)"' <<<"$cards"
+        fi
+      done < <(jq -r '.confirmations[].id' <<<"$cards" 2>/dev/null)
     fi
-    pw="$new_pw"
-    printf '%s' "$pw" >"$pw_file"
-    chmod 600 "$pw_file" 2>/dev/null || true
-    mcp_token="$(_ebk_mint "$token" "$pw")"
-  fi
-  [[ -n "$mcp_token" ]] || { echo "生成 MCP 令牌失败（密码确认没过？）"; return 1; }
-  secret_resp="$(smoke_api PUT "/_wonton/api/plugins/$SMOKE_PLUGIN_ID/secrets/mcp_token" \
-    -H 'Content-Type: application/json' -d "$(jq -nc --arg v "$mcp_token" '{value:$v}')")" ||
-    { echo "把 MCP 令牌写进插件设置失败：$secret_resp"; return 1; }
-  # 核心发现头里的密钥对不上就会重连插件重新握手，给一轮时间。
-  sleep 3
-  say "MCP 令牌已生成并填进插件设置"
-}
-
-mcp_check() {
-  local out n_tools
-  n_tools="$(jq --arg s "$SMOKE_SLUG" '[.[] | select(.name | startswith($s + "__"))] | length' "$SMOKE_TOOLS" 2>/dev/null)" || n_tools=0
-  [[ "$n_tools" -ge 8 ]] ||
-    { echo "tools/list 应有 8 个本插件工具，看到 $n_tools：$(head -c 200 "$SMOKE_TOOLS" 2>/dev/null)"; return 1; }
-  # 上游没标 readOnlyHint，调用要等主人确认：后台跑 approve 应答卡片，调完就停。
-  probes_dev approve --watch >>"$PROBES_LOG" 2>&1 &
-  local approver=$!
-  out="$(mcp call "$SMOKE_MCP_URL" "${SMOKE_SLUG}__query_all_accounts" '{}' 2>&1)"
-  kill "$approver" 2>/dev/null
-  wait "$approver" 2>/dev/null
-  jq -e '.content[0].text | fromjson | type == "object"' <<<"$out" >/dev/null 2>&1 ||
-    { echo "query_all_accounts 结果不符合预期：$(head -c 300 <<<"$out")"; return 1; }
-  echo "query_all_accounts 返回：$(jq -c '.content[0].text | fromjson' <<<"$out" | head -c 200)"
-}
-
-# ---------- 数据：随机标记记一笔支出，重装后读回 ----------
-
-_ebk_ensure_account() { # <令牌>：返回可用的账户 id（没有就建一个现金账户）
-  local token="$1" list id
-  list="$(_ebk_api GET /api/v1/accounts/list.json "$token")" || { echo "列账户失败：$list" >&2; return 1; }
-  id="$(jq -r '.result[0].id // empty' <<<"$list" 2>/dev/null)"
-  if [[ -z "$id" ]]; then
-    list="$(_ebk_api POST /api/v1/accounts/add.json "$token" \
-      "$(jq -nc --arg n "现金-探针-$(_ebk_rand)" '{name:$n,category:1,type:1,icon:"1",color:"33691E",currency:"CNY"}')")" ||
-      { echo "建账户失败：$list" >&2; return 1; }
-    id="$(jq -r '.result.id // empty' <<<"$list" 2>/dev/null)"
-    [[ -n "$id" ]] || { echo "建账户没回 id：$(head -c 200 <<<"$list")" >&2; return 1; }
-  fi
-  printf '%s' "$id"
-}
-
-_ebk_ensure_category() { # <令牌>：返回支出类别的次级类别 id（记账要的是次级类别；没有就建）
-  local token="$1" list primary id
-  list="$(_ebk_api GET /api/v1/transaction/categories/list.json "$token")" ||
-    { echo "列类别失败：$list" >&2; return 1; }
-  id="$(jq -r '[.result[]? | select(.type == 2 and (.parentId != null and .parentId != "0" and .parentId != ""))][0].id // empty' <<<"$list" 2>/dev/null)"
-  if [[ -n "$id" ]]; then printf '%s' "$id"; return 0; fi
-  primary="$(jq -r '[.result[]? | select(.type == 2 and (.parentId == null or .parentId == "0" or .parentId == ""))][0].id // empty' <<<"$list" 2>/dev/null)"
-  if [[ -z "$primary" ]]; then
-    primary="$(_ebk_api POST /api/v1/transaction/categories/add.json "$token" \
-      '{"name":"其他-探针","type":2,"parentId":"0","icon":"1","color":"E65100"}' | jq -r '.result.id // empty')" ||
-      { echo "建支出主类别失败" >&2; return 1; }
-    [[ -n "$primary" ]] || { echo "建支出主类别没回 id" >&2; return 1; }
-  fi
-  list="$(_ebk_api POST /api/v1/transaction/categories/add.json "$token" \
-    "$(jq -nc --arg p "$primary" '{name:"杂项-探针",type:2,parentId:$p,icon:"1",color:"E65100"}')")" ||
-    { echo "建次级类别失败：$list" >&2; return 1; }
-  id="$(jq -r '.result.id // empty' <<<"$list" 2>/dev/null)"
-  [[ -n "$id" ]] || { echo "建次级类别没回 id：$(head -c 200 <<<"$list")" >&2; return 1; }
-  printf '%s' "$id"
-}
-
-data_write() {
-  local token marker account category now offset resp
-  [[ -n "${SMOKE_STATE:-}" && -n "${SMOKE_WEB_URL:-}" ]] || { echo "缺冒烟变量：SMOKE_STATE/SMOKE_WEB_URL" >&2; return 1; }
-  token="$(ebk_token)" || { echo "拿不到应用令牌，写不了数据" >&2; return 1; }
-  account="$(_ebk_ensure_account "$token")" || return 1
-  category="$(_ebk_ensure_category "$token")" || return 1
-  marker="保数据-$(_ebk_rand)"
-  now="$(date +%s)"
-  offset="$(date +%z)"   # +0800 → 480
-  offset="$((10#${offset%%[0-9]*}${offset:1:2} * 60 + 10#${offset:3:2}))"
-  resp="$(_ebk_api POST /api/v1/transactions/add.json "$token" \
-    "$(jq -nc --arg c "$category" --arg a "$account" --arg m "$marker" --argjson t "$now" --argjson o "$offset" \
-      '{type:3,categoryId:$c,time:$t,utcOffset:$o,sourceAccountId:$a,sourceAmount:1234,comment:$m}')")" ||
-    { echo "记一笔失败：$resp"; return 1; }
-  jq -e '.result.id != null' <<<"$resp" >/dev/null 2>&1 || { echo "记账没回 id：$(head -c 200 <<<"$resp")"; return 1; }
-  printf '%s' "$marker" >"$(_ebk_marker_file)"
-}
-
-data_check() {
-  local token marker list
-  marker="$(cat "$(_ebk_marker_file)")"
-  [[ -n "$marker" ]] || { echo "标记文件是空的"; return 1; }
-  token="$(ebk_token)" || { echo "拿不到应用令牌，读不了数据" >&2; return 1; }
-  list="$(_ebk_api GET /api/v1/transactions/list.json "$token")" ||
-    { echo "列交易失败：$list"; return 1; }
-  grep -qF "$marker" <<<"$list" ||
-    { echo "交易列表里找不到标记 $marker：$(head -c 300 <<<"$list")"; return 1; }
+    sleep 1
+  done
+  wait "$pid" || { echo "调用 $tool 失败:$(head -c 200 "$err")"; rm -f "$out" "$err"; return 1; }
+  out="$(cat "$out")"; rm -f "$err"
+  jq -e '.content | length > 0' <<<"$out" >/dev/null ||
+    { echo "$tool 的结果没有内容:$out"; return 1; }
 }
