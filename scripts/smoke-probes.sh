@@ -40,11 +40,12 @@ _ebk_api() {
   fi
 }
 
-# 走完浏览器式 OIDC 拿应用令牌：核心会话先补进 jar（-b 保留别的域的会话），再跟 /oauth2/login
-# 的重定向链；回调成功页的地址里带着应用令牌，fragment 不发给服务器，只能从 Location 头取。
+# 走完浏览器式 OIDC 拿应用会话令牌：核心会话先补进 jar（-b 保留别的域的会话），再跟 /oauth2/login
+# 的重定向链；回调成功页的地址里带着临时令牌（fragment 不发给服务器，只能从 Location 头取），
+# 再按前端登录后的同一步 POST /api/oauth2/authorize.json 换成正式会话令牌。
 # client_session_id 每次随机：它是上游的防重键，写死会让一次没走完的登录挡住后面的登录（300 秒）。
 ebk_token() {
-  local jar base url loc i token
+  local jar base url loc i token out
   jar="${SMOKE_JAR:-}" base="${SMOKE_BASE:-}"
   [[ -n "$jar" && -n "$base" && -n "${SMOKE_TOKEN:-}" && -n "${SMOKE_WEB_URL:-}" ]] ||
     { echo "缺冒烟变量：需要 SMOKE_JAR/SMOKE_BASE/SMOKE_TOKEN/SMOKE_WEB_URL" >&2; return 1; }
@@ -61,6 +62,12 @@ ebk_token() {
       token="${token%%&*}"
       token="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.unquote(sys.argv[1]))' "$token")"
       [[ -n "$token" ]] || { echo "回调地址里 token 为空：$url" >&2; return 1; }
+      out="$(curl_t "$SMOKE_WEB_MAX_TIME" "$(_ebk_origin)/api/oauth2/authorize.json" --noproxy '*' -X POST \
+        -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+        -d "$(jq -nc --arg t "$token" '{token:$t}')")" ||
+        { echo "临时令牌换会话令牌失败：$out"; return 1; }
+      token="$(jq -r '.result.token // empty' <<<"$out" 2>/dev/null)"
+      [[ -n "$token" ]] || { echo "换会话令牌的响应里没有 token：$(head -c 200 <<<"$out")" >&2; return 1; }
       printf '%s' "$token"
       return 0
     fi
@@ -81,29 +88,39 @@ identity_check() {
 # ---------- 工具（MCP）：先按主人流程备好令牌，再经总线调只读查询 ----------
 
 before_mcp() {
-  local token pw pw_file new_pw login mcp_token secret_resp
+  local token pw pw_file new_pw mcp_token secret_resp resp
   [[ "$SMOKE_SSO" == oidc ]] || { echo "清单不是 sso: oidc，备凭据的探针不适用"; return 1; }
-  token="$(ebk_token)" || { echo "拿不到应用令牌：OIDC 登录链失败"; return 1; }
+  token="$(ebk_token)" || { echo "拿不到应用会话令牌：OIDC 登录链失败"; return 1; }
   pw_file="$(_ebk_pw_file)"
   pw="$(cat "$pw_file" 2>/dev/null || true)"
+
+  _ebk_mint() { # <会话令牌> <密码>：生成 MCP 令牌，输出到标准输出；失败输出空
+    _ebk_api POST /api/v1/tokens/generate/mcp.json "$1" \
+      "$(jq -nc --arg p "$2" '{password:$p}')" 2>/dev/null | jq -r '.result.token // empty' 2>/dev/null
+  }
+
   if [[ -n "$pw" ]]; then
-    login="$(_ebk_api POST /api/v1/authorize.json "$token" \
-      "$(jq -nc --arg u "$SMOKE_OWNER" --arg p "$pw" '{username:$u,password:$p}')" 2>/dev/null)" &&
-      jq -e '.result.token != null' <<<"$login" >/dev/null 2>&1 || pw=""
+    mcp_token="$(_ebk_mint "$token" "$pw")"
   fi
-  if [[ -z "$pw" ]]; then
+  if [[ -z "${mcp_token:-}" ]]; then
+    # 没有存档密码（首次）或存档的密码不对（账号密码被改过）：设一个新密码再生成。
+    # OIDC 自动建号的账号没有密码，profile/update 不要求旧密码；有密码时要带上旧密码。
     new_pw="ebk-probe-$(_ebk_rand)"
-    login="$(_ebk_api POST /api/v1/users/profile/update.json "$token" \
-      "$(jq -nc --arg p "$new_pw" '{password:$p}')")" ||
-      { echo "给 owner 账号设密码失败（账号已有别的密码？）：$login"; return 1; }
+    if [[ -n "$pw" ]]; then
+      resp="$(_ebk_api POST /api/v1/users/profile/update.json "$token" \
+        "$(jq -nc --arg o "$pw" --arg p "$new_pw" '{oldPassword:$o,password:$p}')" 2>/dev/null)" ||
+        { echo "改 owner 账号密码失败：$resp"; return 1; }
+    else
+      resp="$(_ebk_api POST /api/v1/users/profile/update.json "$token" \
+        "$(jq -nc --arg p "$new_pw" '{password:$p}')" 2>/dev/null)" ||
+        { echo "给 owner 账号设密码失败（账号已有别的密码？）：$resp"; return 1; }
+    fi
     pw="$new_pw"
     printf '%s' "$pw" >"$pw_file"
     chmod 600 "$pw_file" 2>/dev/null || true
+    mcp_token="$(_ebk_mint "$token" "$pw")"
   fi
-  mcp_token="$(_ebk_api POST /api/v1/tokens/generate/mcp.json "$token" \
-    "$(jq -nc --arg p "$pw" '{password:$p}')" | jq -r '.result.token // empty')" ||
-    { echo "生成 MCP 令牌失败"; return 1; }
-  [[ -n "$mcp_token" ]] || { echo "生成 MCP 令牌的响应里没有 token"; return 1; }
+  [[ -n "$mcp_token" ]] || { echo "生成 MCP 令牌失败（密码确认没过？）"; return 1; }
   secret_resp="$(smoke_api PUT "/_wonton/api/plugins/$SMOKE_PLUGIN_ID/secrets/mcp_token" \
     -H 'Content-Type: application/json' -d "$(jq -nc --arg v "$mcp_token" '{value:$v}')")" ||
     { echo "把 MCP 令牌写进插件设置失败：$secret_resp"; return 1; }
