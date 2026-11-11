@@ -7,8 +7,8 @@
 # 工具：上游工具都没标 readOnlyHint（每次调用总线都发确认卡片），不能写 MCP_TOOL（套件要求标注），
 #       写 mcp_check：套件先跑 mcp list（结果在 $SMOKE_TOOLS），再由这里后台跑 approve 应答卡片、
 #       调 query_all_accounts。调用前要备凭据，写在 before_mcp：按 README 写的主人流程的等价 API——
-#       给 owner 账号设密码（OIDC 建的号没有密码）→ 密码登录 → 生成 MCP 令牌 → 经核心接口填进插件
-#       的 input 密钥（等价于主人在设置页粘贴）。
+#       给 owner 账号设密码（OIDC 建的号没有密码，不要求旧密码）→ 生成 MCP 令牌（生成要过密码确认）
+#       → 经核心接口填进插件的 input 密钥（等价于主人在设置页粘贴）。
 # 数据：data_write 用随机标记经应用 API 记一笔支出，标记写进 $SMOKE_STATE；data_check 读回标记去
 #       transactions/list 里找。OIDC 自动建号的账本是空的，先建账户和类别。
 
