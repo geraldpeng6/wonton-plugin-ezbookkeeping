@@ -69,7 +69,7 @@ configs:
     file: config/init.sh
 
 x-wonton:
-  spec: "0.12"
+  spec: "0.11"
   id: net.mayswind.ezbookkeeping
   version: 0.1.0
   kind: app
