@@ -4,180 +4,66 @@
 # 变量别叫 state：shellcheck 把这份文件连着 probes.sh 一起分析，probes.sh 自己也读一个 dev.sh 提供的 state；
 # 子壳体函数（fn() ( … )）里给 state 赋值，SC2031 就报在 probes.sh 上，CI 红。
 #
-# 变量：两套冒烟环境（dev.sh smoke、正式 e2e 套件）都给的只有 SMOKE_STATE、SMOKE_JAR、SMOKE_WEB_URL、
-#       SMOKE_OWNER、SMOKE_BASE、SMOKE_TOKEN、SMOKE_INSTANCE 和 web_get、dweb。SMOKE_WEB_URL 的含义两边不同
-#       （dev.sh smoke 是带路径的网页入口，正式套件剥成只有 origin），拼 API 和读核心接口都用 _ebk_origin
-#       现场取的 origin；插件 id 硬编码在下面（正式套件的钩子约定里没有 SMOKE_PLUGIN_ID，读主人初始密码的
-#       核心接口要用它），不依赖 SMOKE_WEB_ORIGIN/SMOKE_PLUGIN_ID。
+# 变量：SMOKE_WEB_URL 是应用的网页入口（套件已去尾斜杠，但可能带路径，比如 SSO 登录页）；
+#       拼 API 路径用 SMOKE_WEB_ORIGIN（只有 scheme://host:port，入口的路径不掺进来），别直接接在 SMOKE_WEB_URL 后面。
 #
 # 页面：web_assert 从标准输入读页面，命中的确是应用的真实页面时返回 0。
-# 身份：identity_check 只证明身份：用应用自己的"当前用户"接口断言认出的是用户管理员，不碰应用里的数据。
-# 数据断言（有几条、内容对不对）全部交给 data_write / data_check：data_write 用随机标记写数据并把标记
-# 存进 SMOKE_STATE，data_check 读回标记去应用里找，对不上就打印看到了什么并返回非 0。
-# 工具：mcp_check 断言总线上有本插件的工具并真调一次（两套环境各自的 MCP 变量见函数内说明）。
-#
-# 登录是这个插件自己的（sso: none）：主人账号装好时预建（用户名=云吞用户名），初始密码由核心生成、
-# show_owner，探针经核心 API 读取（这条读会被核心审计），再走应用自己的 authorize.json 登录取用户令牌。
-# 登录失败会计入应用的每 IP 限速（默认 5 次/分钟），所以一轮里只登录一次，令牌在同一轮探针里复用，失败不重试。
-# shellcheck disable=SC2034  # SSO/MCP 由冒烟套件读取
-SSO=none
-MCP=1
+# 身份：identity_check 只证明身份：用应用自己的“当前用户”接口断言认出的是用户管理员，不碰应用里的数据。
+#       数据断言（是否配置过、有几条、内容对不对）全部交给 data_write / data_check：冒烟第 1 项会先装升级
+#       起点写数据，身份探针再断言“数据目录是空的”就会红。接口回字段时也只看类型（如 configured 是布尔、
+#       nodes 是数字），值和条数留给 data_check。
+#       没有用户体系时写 IDENTITY_NA=1，并在 SMOKE_NOTE 里写原因。dweb / web_get 是带用户会话的请求助手，可继续走应用自己的登录链。
+#       SSO 登录跳转不用自己写表单逻辑：dweb --sso 会从清单 webui.path 的入口出发（没写就是 /），提交核心
+#       登录页的 JS 自动表单并跟完重定向，返回的页面已带应用的登录态。
+# 工具：MCP_TOOL 写一个只读工具名（可带插件前缀），MCP_ARGS 是 JSON 参数；mcp_assert 从标准输入读调用结果。
+#       要断言多个工具时改成写 mcp_check；调用前要备数据时写 before_mcp。
+# 通知房间：申请了 notify 的插件把通知交给核心，核心以核心账号发进和主人的“Wonton”私聊。
+#       探针以主人身份读这个房间：probes_owner_room_wait <超时秒> <要找的文字> 等到开始之后发来的、包含这段文字的
+#       消息就返回 0，超时列出看到的最新消息并返回非 0。要先把等待挂到后台再发通知，否则消息可能在等待开始前就到：
+#         room_wait() {
+#           local marker="probe-$RANDOM" url
+#           url="$(docker exec "wonton-$SMOKE_INSTANCE--${SMOKE_PLUGIN_ID//./-}--web" printenv WONTON_NOTIFY_URL)"
+#           probes_owner_room_wait 120 "$marker" & local pid=$!
+#           docker exec "wonton-$SMOKE_INSTANCE--${SMOKE_PLUGIN_ID//./-}--web" wget -q -O /dev/null \
+#             --header 'Content-Type: application/json' --post-data "{\"title\":\"$marker\"}" "$url"
+#           wait "$pid"
+#         }
+#       上面的 web 换成插件里能发 HTTP 的服务；wget 换成那个服务里有的客户端。
+# 数据：合并前要验证“升级/重装不丢用户数据”时写 data_write 和 data_check（两个都写才跑）：data_write 用随机标记写
+#       一条数据并把标记原样存进 $SMOKE_STATE，data_check 读回标记去应用里找，对不上就打印看到了什么并返回非 0。
+#       应用不存用户数据时写 DATA_NA=1（两项记 N/A）。
+# 装之前要准备（如先配出口代理）：写 before_install。
+# 设置：清单有 settings 时，冒烟装插件要填的值写 export SMOKE_SETTINGS=(名字=值 …)（如要用户同意许可的必填项），
+#       不写进 Schema 的 default；临时多给几项用 scripts/dev.sh smoke --setting 名字=值。
+# 附加检查：六项之外还要验的（发一条通知、经网关真调一次模型等）写 extra_check，在工具项之后跑、限 EXTRA_TIMEOUT 秒
+#       （默认 600），结果另记一行“附加检查”，失败同样算冒烟失败。一次要验好几件事时，每件用
+#       extra_item <PASS|FAIL|N/A> <子项> <说明> 记一行，结果行是“附加检查·<子项>”，任一子项 FAIL 即失败。
+#       Agent 插件（扮演用户手机发加密消息、确认卡片、名单外不应答等）组合 scripts/agent-probes.sh 的 agent_check_*，
+#       写法见那个文件的开头。
+# 探针自己起的容器（如一次性的对端服务）加上标签 wonton.instance=$SMOKE_INSTANCE，冒烟结束时随实例一起删掉。
 
-EBK_ID="net.mayswind.ezbookkeeping"
-EBK_TOKEN=""
+web_assert() { grep -q '你好'; }   # 示例页的标题
 
-_ebk_origin() { # SMOKE_WEB_URL 两边含义不同（一个带入口路径、一个只有 origin），拼 API 前取 origin
-  local u="${SMOKE_WEB_URL%%\?*}" rest="${SMOKE_WEB_URL#*://}"
-  printf '%s://%s' "${u%%://*}" "${rest%%/*}"
+identity_check() { # 页面回显的就是网关注入的用户名；示例页不存数据，也不拿数据判断身份
+  local page
+  page="$(dweb /)" || { echo "页面失败：$page"; return 1; }
+  grep -qF "你好，$SMOKE_OWNER" <<<"$page" || { echo "页面没回显用户 $SMOKE_OWNER：$(head -c 120 <<<"$page")"; return 1; }
 }
 
-_ebk_core_session() { # 主人令牌登进核心会话，再走一遍插件域名的会话交接（APP Cookie 落进同一个 jar）
-  [[ -n "${SMOKE_JAR:-}" && -n "${SMOKE_BASE:-}" && -n "${SMOKE_TOKEN:-}" && -n "${SMOKE_WEB_URL:-}" ]] ||
-    { echo "缺冒烟变量：SMOKE_JAR/SMOKE_BASE/SMOKE_TOKEN/SMOKE_WEB_URL" >&2; return 1; }
-  # -b 保留 jar 里已有的会话（只写 -c 会把别的域的会话抹掉）
-  curl -sS --noproxy '*' --max-time 120 -o /dev/null -b "$SMOKE_JAR" -c "$SMOKE_JAR" \
-    --data-urlencode "token=${SMOKE_TOKEN}" "${SMOKE_BASE}/_wonton/login" ||
-    { echo "主人令牌登不进核心会话" >&2; return 1; }
-  # 插件网页在核心会话之外：未登录的页面请求跳核心 /_wonton/sso，跟完交接在插件域名种上应用会话
-  curl -sS --noproxy '*' --max-time 120 -o /dev/null -L -b "$SMOKE_JAR" -c "$SMOKE_JAR" \
-    -H 'Accept: text/html' "$(_ebk_origin)/" ||
-    { echo "走不通插件网页的会话交接" >&2; return 1; }
-}
-
-_ebk_password() { # 主人的初始密码（核心 API 的响应是 {"value":"…"}）
-  local v
-  _ebk_core_session || return 1
-  v="$(curl -sS --noproxy '*' --max-time 120 --fail-with-body -b "$SMOKE_JAR" -H "Authorization: Bearer ${SMOKE_TOKEN}" \
-    "${SMOKE_BASE}/_wonton/api/plugins/${EBK_ID}/secrets/owner_password")" ||
-    { echo "核心里读不到主人初始密码（secrets.owner_password）" >&2; return 1; }
-  v="$(jq -r '.value // empty' <<<"$v")"
-  [[ -n "$v" ]] || { echo "核心没给初始密码的值" >&2; return 1; }
-  printf '%s' "$v"
-}
-
-_ebk_login() { # <用户名> <密码>：成功输出应用的用户令牌
-  local resp
-  [[ -n "${SMOKE_WEB_URL:-}" ]] || { echo "缺冒烟变量：SMOKE_WEB_URL" >&2; return 1; }
-  resp="$(curl -sS --noproxy '*' --max-time 120 --fail-with-body -b "${SMOKE_JAR:-}" -X POST -H 'Content-Type: application/json' \
-    -d "{\"loginName\":\"$1\",\"password\":\"$2\"}" "$(_ebk_origin)/api/authorize.json")" ||
-    { echo "应用登录失败（账号 $1，用初始密码）" >&2; return 1; }
-  printf '%s' "$resp" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'
-}
-
-ebk_api() { # <方法> <路径> [JSON 正文]：用 $EBK_TOKEN 调应用接口，输出响应
-  local method="$1" path="$2" body="${3:-}"
-  local args=(-sS --noproxy '*' --max-time 120 -b "${SMOKE_JAR:-}" -X "$method" \
-    -H "Authorization: Bearer $EBK_TOKEN" -H 'X-Timezone-Offset: 480')
-  [[ -n "$body" ]] && args+=(-H 'Content-Type: application/json' -d "$body")
-  curl "${args[@]}" "$(_ebk_origin)$path"
-}
-
-_ebk_token() { # 一轮探针共用一个登录态
-  local pw
-  if [[ -z "$EBK_TOKEN" ]]; then
-    pw="$(_ebk_password)" || return 1
-    EBK_TOKEN="$(_ebk_login "${SMOKE_OWNER:-owner}" "$pw")" || return 1
-  fi
-  printf '%s' "$EBK_TOKEN"
-}
-
-web_assert() { # 登录页就是应用自己的（SPA 外壳，标题写死 ezBookkeeping）
-  grep -qi '<title>[^<]*ezBookkeeping'
-}
-
-identity_check() {
-  local resp
-  _ebk_token >/dev/null || { echo "拿不到应用登录态（读初始密码或登录失败）"; return 1; }
-  resp="$(ebk_api GET /api/v1/users/profile/get.json)" || { echo "取不到当前用户"; return 1; }
-  jq -e --arg owner "${SMOKE_OWNER:-owner}" '.success == true and .result.username == $owner' <<<"$resp" >/dev/null ||
-    { echo "认出的不是管理员：$(head -c 160 <<<"$resp")"; return 1; }
-}
-
-_ebk_marker_file() { # SMOKE_STATE 在套件里可能是状态目录（e2e 传的是标记文件本身），标记放对应路径
-  if [[ -d "${SMOKE_STATE:-}" ]]; then printf '%s' "$SMOKE_STATE/ezbookkeeping-marker"; else printf '%s' "${SMOKE_STATE}.marker"; fi
-}
-
-data_write() { # 现金账户 + 支出主分类和子分类 + 一笔带随机标记的支出，标记存进 SMOKE_STATE
-  # 上游规定交易只能挂子分类（pkg/services/transactions.go isCategoryValid：主分类拒收），所以建两级
-  local marker acc cat sub resp
-  _ebk_token >/dev/null || { echo "拿不到应用登录态，写不了数据"; return 1; }
-  marker="保数据-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
-
-  resp="$(ebk_api POST /api/v1/accounts/add.json \
-    '{"name":"现金","category":1,"type":1,"icon":"1","iconType":0,"color":"4285f4","currency":"CNY","balance":"0"}')" ||
-    { echo "建账户失败：$(head -c 160 <<<"$resp")"; return 1; }
-  acc="$(jq -r '.result.id // empty' <<<"$resp")"
-  [[ -n "$acc" && "$acc" != null ]] || { echo "建账户的响应里没有账户：$(head -c 160 <<<"$resp")"; return 1; }
-
-  resp="$(ebk_api POST /api/v1/transaction/categories/add.json \
-    '{"name":"餐饮","type":2,"icon":"1","iconType":0,"color":"4285f4"}')" ||
-    { echo "建主分类失败：$(head -c 160 <<<"$resp")"; return 1; }
-  cat="$(jq -r '.result.id // empty' <<<"$resp")"
-  [[ -n "$cat" && "$cat" != null ]] || { echo "建主分类的响应里没有分类：$(head -c 160 <<<"$resp")"; return 1; }
-
-  resp="$(ebk_api POST /api/v1/transaction/categories/add.json \
-    "{\"name\":\"买菜\",\"type\":2,\"parentId\":\"$cat\",\"icon\":\"1\",\"iconType\":0,\"color\":\"4285f4\"}")" ||
-    { echo "建子分类失败：$(head -c 160 <<<"$resp")"; return 1; }
-  sub="$(jq -r '.result.id // empty' <<<"$resp")"
-  [[ -n "$sub" && "$sub" != null ]] || { echo "建子分类的响应里没有分类：$(head -c 160 <<<"$resp")"; return 1; }
-
-  resp="$(ebk_api POST /api/v1/transactions/add.json "{\"type\":3,\"time\":$(date +%s),\
-\"sourceAccountId\":\"$acc\",\"sourceAmount\":2345,\"categoryId\":\"$sub\",\"comment\":\"$marker\"}")" ||
-    { echo "记账失败：$(head -c 160 <<<"$resp")"; return 1; }
-  jq -e --arg m "$marker" '.success == true and .result.comment == $m' <<<"$resp" >/dev/null ||
-    { echo "记账没有成功：$(head -c 160 <<<"$resp")"; return 1; }
-  jq -nc --arg m "$marker" --arg a "$acc" '{marker:$m,account_id:$a}' >"$(_ebk_marker_file)"
-}
-
-data_check() { # 按标记把那笔账搜出来
-  local marker resp
-  marker="$(jq -r .marker "$(_ebk_marker_file)")"
-  _ebk_token >/dev/null || { echo "拿不到应用登录态，查不了数据"; return 1; }
-  resp="$(ebk_api GET "/api/v1/transactions/list.json?keyword=$marker&count=20&with_count=true")" ||
-    { echo "查交易失败：$(head -c 160 <<<"$resp")"; return 1; }
-  jq -e --arg m "$marker" '.success == true and ([.result.items[].comment] | index($m) != null)' <<<"$resp" >/dev/null ||
-    { echo "找不到写进去的那笔账（标记 $marker）：$(head -c 200 <<<"$resp")"; return 1; }
-}
-
-mcp_check() { # 总线上有本插件的工具,并真调一次:总线的工具调用先发确认卡,探针替主人批准(用核心 API)
-  # 两套环境的变量:dev.sh smoke 给 SMOKE_MCP_URL/SMOKE_SLUG,正式套件给 E2E_MCP_URL/E2E_SLUG,mcp 助手两边都有
-  local url="${E2E_MCP_URL:-${SMOKE_MCP_URL:-}}" slug="${E2E_SLUG:-${SMOKE_SLUG:-}}"
-  local tools tool out err pid approved="" i cards id reply
-  [[ -n "$url" && -n "$slug" ]] || { echo "缺 MCP 冒烟变量(MCP_URL/SLUG)" >&2; return 1; }
-  [[ -n "${SMOKE_BASE:-}" && -n "${SMOKE_TOKEN:-}" ]] ||
-    { echo "缺冒烟变量:SMOKE_BASE/SMOKE_TOKEN" >&2; return 1; }
-  tools="$(mcp list "$url")" || { echo "tools/list 失败"; return 1; }
-  tool="${slug}__query_all_accounts"
-  jq -e --arg t "$tool" 'any(.[]; .name == $t)' <<<"$tools" >/dev/null ||
-    { echo "tools/list 没有 $tool:$(head -c 200 <<<"$tools")"; return 1; }
-  # 上游的 MCP 服务不实现工具注解,读工具标不了 readOnlyHint,总线每次调用都发确认卡等批准;
-  # 上游能力缺口,在 README 和 PR 里写明。这里后台发起调用,轮询确认卡替主人批准,再收结果。
-  out="$(mktemp)"; err="$(mktemp)"
-  mcp call "$url" "$tool" '{}' >"$out" 2>"$err" &
-  pid=$!
-  for ((i = 0; i < 60; i++)); do
-    kill -0 "$pid" 2>/dev/null || break
-    if [[ -z "$approved" ]] &&
-      cards="$(curl -sS --noproxy '*' --max-time 10 -H "Authorization: Bearer ${SMOKE_TOKEN}" \
-        "${SMOKE_BASE}/_wonton/api/confirmations" 2>/dev/null)" &&
-      [[ "$(jq -r '.confirmations | length' <<<"$cards" 2>/dev/null)" != 0 ]]; then
-      while IFS= read -r id; do
-        [[ -n "$id" ]] || continue
-        if reply="$(curl -sS --noproxy '*' --max-time 10 -X POST \
-          -H "Authorization: Bearer ${SMOKE_TOKEN}" -H 'Content-Type: application/json' \
-          -d '{"answer":"approve"}' "${SMOKE_BASE}/_wonton/confirmations/$id")" &&
-          grep -q '"success":true' <<<"$reply"; then
-          approved=1
-          jq -r --arg id "$id" '.confirmations[] | select(.id == $id) | "已替主人批准:\(.title)"' <<<"$cards"
-        else
-          echo "批准卡片 $id 没成功:$(head -c 120 <<<"$reply")" >&2
-        fi
-      done < <(jq -r '.confirmations[].id' <<<"$cards" 2>/dev/null)
-    fi
-    sleep 1
-  done
-  wait "$pid" || { echo "调用 $tool 失败:$(head -c 200 "$err")"; rm -f "$out" "$err"; return 1; }
-  out="$(cat "$out")"; rm -f "$err"
-  jq -e '.content | length > 0' <<<"$out" >/dev/null ||
-    { echo "$tool 的结果没有内容:$out"; return 1; }
-}
+# 数据：合并前要验证“升级/重装不丢用户数据”时写 data_write 和 data_check（两个都写才跑）：
+#   data_write 用随机标记写一条数据，把标记原样覆盖写进 $SMOKE_STATE（一个已建好的空文件，不是目录）；data_check 读回标记、去应用里找，
+#   找不到就打印看到了什么并返回非 0。
+# 应用不存用户数据时写 DATA_NA=1（两项记 N/A）。模板的示例页不存数据，所以这里是不适用。
+# 数据要写进插件容器时（Agent 插件的工作区标记等），容器名别自己拼：钩子契约里没有 SMOKE_SLUG，e2e 套件的
+# data_write 又跑在实例名导出之前，拼出来的名字缺段（No such container）；Bot 服务（清单声明了 bots）每个 Bot
+# 一组容器，名字还带 --<Bot 名> 后缀。按核心打的标签找，插件自带 smoke 和 e2e 套件两个运行环境都成立
+# （实例名没导出时按 SMOKE_BASE 的主机名第一段推）：
+#   _container() { # <插件 id> <服务名>：本实例里这个服务的容器
+#     local inst="${SMOKE_INSTANCE:-}" args=(--filter "label=wonton.plugin=$1" --filter "label=wonton.service=$2")
+#     if [[ -z "$inst" && -n "${SMOKE_BASE:-}" ]]; then
+#       inst="${SMOKE_BASE#http://}"; inst="${inst%%.*}"
+#     fi
+#     [[ -z "$inst" ]] || args+=(--filter "label=wonton.instance=${inst//-/}")
+#     docker ps --format '{{.Names}}' "${args[@]}" | head -1
+#   }
+export DATA_NA=1
