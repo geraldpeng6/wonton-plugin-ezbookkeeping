@@ -55,6 +55,10 @@ need() {
 : "${SMOKE_API_MAX_TIME:=600}"
 : "${SMOKE_DOWNLOAD_MAX_TIME:=180}"
 : "${SMOKE_CONNECT_TIMEOUT:=30}"
+# 冒烟里给确认卡片配验收设备用的工具镜像（核心仓库 deploy/dev/core/Dockerfile 的 tunnel-client 构建目标，
+# test-images 工作流发在 ghcr）。工具要主人确认时冒烟得有一台已配对的设备，核心才肯把卡片留下；:main 跟
+# 冒烟默认的核心镜像同一批构建。调用方已给的 WONTON_SMOKE_TUNNEL_CLIENT_IMAGE 优先。
+: "${SMOKE_TUNNEL_CLIENT_IMAGE:=ghcr.io/wontonapp/wonton-tunnel-client:main}"
 
 # 带超时的 curl：<秒数> <地址> [<curl 参数>…]，地址放在最后交给 curl。超时（curl 退出码 28）时在 stderr
 # 写地址和秒数，curl 自己只会给“curl: (28)”；调用方在自己的参数里给的 --max-time 优先，报的也是那个数。
