@@ -27,27 +27,36 @@
 # 探针自己起的容器（如一次性的对端服务）加上标签 wonton.instance=$SMOKE_INSTANCE，冒烟结束时随实例一起删掉。
 
 # ezbookkeeping 的探针。sso=none：应用自己管登录（init 用核心生成的初始密码建号，初始密码在核心收存的
-# 插件密钥里），探针读这份密码走应用自己的 authorize.json 建会话；init 建的是第一个账号，上游约定第一个
-# 用户就是管理员，这里断言应用认出主人即可。
-# 工具探针用只读的 query_all_accounts（无参）。应用数据是账本（SQLite），镜像升级不触数据层，升级/重装
-# 保数据此前已由首版冒烟验证过，这里不写 data_write/data_check（两项记 N/A）。
+# 插件密钥里，挂在核心 state 的 plugins/secrets/ 下），探针读这份密码走应用自己的 authorize.json 建会话；
+# init 建的是第一个账号，上游约定第一个用户就是管理员，这里断言应用认出主人即可。
+# 工具探针用只读的 query_all_accounts（总线里的名字按插件 slug 用横线）。数据探针走应用 API 建一个
+# 分类、账户和一笔带标记的支出，升级/重装后按 id 读回对标记。
 
 EBK_ID="net.mayswind.ezbookkeeping"
 
-ebk_owner_password() { # 核心收存的插件密钥（secrets/<插件id>.json）里有初始密码
-  docker exec "wonton-$SMOKE_INSTANCE--core" cat "$SMOKE_DATA_DIR/plugins/secrets/$EBK_ID.json" 2>/dev/null |
+ebk_owner_password() { # 核心收存的插件密钥（data/core/plugins/secrets/<插件id>.json）里有初始密码
+  docker exec "wonton-$SMOKE_INSTANCE--core" cat "$SMOKE_DATA_DIR/core/plugins/secrets/$EBK_ID.json" 2>/dev/null |
     jq -r '(.values.owner_password // .owner_password // empty)'
 }
 
-ebk_token() { # 应用会话令牌：authorize.json，字段是 loginName（不是 username）
+ebk_token() { # 应用会话令牌：authorize.json，字段是 loginName（不是 username）。错误走 stderr，别被命令替换吞掉
   local password resp
   password="$(ebk_owner_password)"
-  [[ -n "$password" ]] || { echo "核心收存的插件密钥里没有 owner_password"; return 1; }
+  [[ -n "$password" ]] || { echo "核心收存的插件密钥里没有 owner_password" >&2; return 1; }
   resp="$(curl_t "$SMOKE_API_MAX_TIME" "$SMOKE_WEB_ORIGIN/api/authorize.json" --noproxy '*' \
     -X POST -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg u "$SMOKE_OWNER" --arg p "$password" '{loginName:$u,password:$p}')")" ||
-    { echo "authorize.json 传输失败"; return 1; }
-  jq -r '(.token // .result.token // empty)' <<<"$resp"
+    { echo "authorize.json 传输失败" >&2; return 1; }
+  token="$(jq -r '(.token // .result.token // empty)' <<<"$resp")"
+  [[ -n "$token" ]] || { echo "登录响应里没有令牌：$(head -c 120 <<<"$resp")" >&2; return 1; }
+  printf '%s' "$token"
+}
+
+ebk_api() { # 带会话令牌的应用 API：<方法> <路径> [JSON 正文]，正文原样输出
+  local method="$1" path="$2" body="${3:-}"
+  local args=(-X "$method" -H "Authorization: Bearer $(ebk_token)")
+  [[ -n "$body" ]] && args+=(-H 'Content-Type: application/json' -d "$body")
+  curl_t "$SMOKE_API_MAX_TIME" "$SMOKE_WEB_ORIGIN$path" --noproxy '*' "${args[@]}"
 }
 
 web_assert() { # 未登录时应用照常给出自己的登录页
@@ -55,18 +64,15 @@ web_assert() { # 未登录时应用照常给出自己的登录页
 }
 
 identity_check() { # 应用自己的"当前用户"接口：认出的是主人（init 建的第一个账号，即管理员）
-  local token me
-  token="$(ebk_token)" || return 1
-  [[ -n "$token" ]] || { echo "登录响应里没有令牌"; return 1; }
-  me="$(curl_t "$SMOKE_API_MAX_TIME" "$SMOKE_WEB_ORIGIN/api/v1/users/profile/get.json" --noproxy '*' \
-    -H "Authorization: Bearer $token")" || { echo "profile/get.json 传输失败"; return 1; }
+  local me
+  me="$(ebk_api GET /api/v1/users/profile/get.json)" || return 1
   jq -e --arg u "$SMOKE_OWNER" \
     '(.user.username // .result.user.username // .username // .result.username) == $u' <<<"$me" >/dev/null ||
     { echo "应用没认出用户 $SMOKE_OWNER：$(head -c 200 <<<"$me")"; return 1; }
 }
 
 # shellcheck disable=SC2034 # probes.sh 按名字读
-MCP_TOOL="net.mayswind.ezbookkeeping__query_all_accounts"
+MCP_TOOL="net-mayswind-ezbookkeeping__query_all_accounts"
 # shellcheck disable=SC2034 # probes.sh 按名字读
 MCP_ARGS='{}'
 
@@ -76,4 +82,33 @@ mcp_assert() { # 只读工具：应答不是错误就算通（新装实例账本
   [[ -n "$out" ]] || { echo "工具调用没有应答"; return 1; }
   jq -e '(.isError // false) == false' <<<"$out" >/dev/null ||
     { echo "工具应答报错：$(head -c 200 <<<"$out")"; return 1; }
+}
+
+data_write() { # 建分类、账户和一笔带随机标记的支出，把"标记 交易id"写进 $SMOKE_STATE
+  local marker category_id account_id resp
+  marker="wonton-smoke-$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  resp="$(ebk_api POST /api/v1/transaction/categories/add.json \
+    "$(jq -nc --arg n "$marker" '{name:$n,type:2,parentId:"0",icon:"1",color:"000000"}')")" || return 1
+  category_id="$(jq -r '(.id // .result.id // .categoryId // .result.categoryId // empty) | tostring' <<<"$resp")"
+  [[ -n "$category_id" && "$category_id" != null ]] || { echo "建分类没回 id：$(head -c 200 <<<"$resp")"; return 1; }
+  resp="$(ebk_api POST /api/v1/accounts/add.json \
+    "$(jq -nc --arg n "$marker" '{name:$n,category:1,type:1,icon:"1",color:"000000",currency:"CNY",balance:"0"}')")" || return 1
+  account_id="$(jq -r '(.id // .result.id // .accountId // .result.accountId // empty) | tostring' <<<"$resp")"
+  [[ -n "$account_id" && "$account_id" != null ]] || { echo "建账户没回 id：$(head -c 200 <<<"$resp")"; return 1; }
+  resp="$(ebk_api POST /api/v1/transactions/add.json \
+    "$(jq -nc --arg c "$category_id" --arg a "$account_id" --arg m "$marker" \
+      '{type:3,categoryId:$c,time:(now*1000|floor),utcOffset:480,sourceAccountId:$a,sourceAmount:100,comment:$m}')")" || return 1
+  local tx_id
+  tx_id="$(jq -r '(.id // .result.id // .transactionId // .result.transactionId // empty) | tostring' <<<"$resp")"
+  [[ -n "$tx_id" && "$tx_id" != null ]] || { echo "建交易没回 id：$(head -c 200 <<<"$resp")"; return 1; }
+  printf '%s %s' "$marker" "$tx_id" >"$SMOKE_STATE"
+}
+
+data_check() { # 按 data_write 存的交易 id 读回，核对标记原样还在
+  local marker tx_id me
+  read -r marker tx_id <"$SMOKE_STATE"
+  [[ -n "$marker" && -n "$tx_id" ]] || { echo "SMOKE_STATE 里没有标记和交易 id"; return 1; }
+  me="$(ebk_api GET "/api/v1/transactions/get.json?id=$tx_id")" || return 1
+  jq -e --arg m "$marker" '(.comment // .result.comment) == $m' <<<"$me" >/dev/null ||
+    { echo "交易 $tx_id 的备注不是 $marker：$(head -c 200 <<<"$me")"; return 1; }
 }
