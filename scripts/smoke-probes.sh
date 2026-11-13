@@ -26,35 +26,26 @@
 #       不写进 Schema 的 default；临时多给几项用 scripts/dev.sh smoke --setting 名字=值。
 # 探针自己起的容器（如一次性的对端服务）加上标签 wonton.instance=$SMOKE_INSTANCE，冒烟结束时随实例一起删掉。
 
-# ezbookkeeping 的探针。sso=none：应用自己管登录（init 用核心生成的初始密码建号，初始密码在核心收存的
-# 插件密钥里，挂在核心 state 的 plugins/secrets/ 下），探针读这份密码走应用自己的 authorize.json 建会话；
+# ezbookkeeping 的探针。sso=none：应用自己管登录（init 用核心生成的初始密码建号），探针不重复登录链，
+# 直接用 init 签发、核心收存的应用级用户令牌（mcp_token）调应用 API——它就是主人的用户令牌；
 # init 建的是第一个账号，上游约定第一个用户就是管理员，这里断言应用认出主人即可。
 # 工具探针用只读的 query_all_accounts（总线里的名字按插件 slug 用横线）。数据探针走应用 API 建一个
 # 分类、账户和一笔带标记的支出，升级/重装后按 id 读回对标记。
 
 EBK_ID="net.mayswind.ezbookkeeping"
 
-ebk_owner_password() { # 核心收存的插件密钥（data/core/plugins/secrets/<插件id>.json）里有初始密码
+ebk_app_token() { # init 签发的应用级用户令牌（核心收存在同一份密钥 JSON 里，值是 base64；标准解码失败再试 URL-safe）
   docker exec "wonton-$SMOKE_INSTANCE--core" cat "$SMOKE_DATA_DIR/core/plugins/secrets/$EBK_ID.json" 2>/dev/null |
-    jq -r '(.values.owner_password // .owner_password // empty)' | base64 -d
+    jq -r '(.values.mcp_token // .mcp_token // empty)' |
+    { read -r raw; printf '%s' "$raw" | base64 -d 2>/dev/null || printf '%s' "$raw" | base64 -d --urlsafe 2>/dev/null; }
 }
 
-ebk_token() { # 应用会话令牌：authorize.json，字段是 loginName（不是 username）。错误走 stderr，别被命令替换吞掉
-  local password resp
-  password="$(ebk_owner_password)"
-  [[ -n "$password" ]] || { echo "核心收存的插件密钥里没有 owner_password" >&2; return 1; }
-  resp="$(curl_t "$SMOKE_API_MAX_TIME" "$SMOKE_WEB_ORIGIN/api/authorize.json" --noproxy '*' \
-    -X POST -H 'Content-Type: application/json' \
-    -d "$(jq -nc --arg u "$SMOKE_OWNER" --arg p "$password" '{loginName:$u,password:$p}')")" ||
-    { echo "authorize.json 传输失败" >&2; return 1; }
-  token="$(jq -r '(.token // .result.token // empty)' <<<"$resp")"
-  [[ -n "$token" ]] || { echo "登录响应里没有令牌：$(head -c 120 <<<"$resp")" >&2; return 1; }
-  printf '%s' "$token"
-}
-
-ebk_api() { # 带会话令牌的应用 API：<方法> <路径> [JSON 正文]，正文原样输出
+ebk_api() { # 带应用用户令牌的应用 API：<方法> <路径> [JSON 正文]，正文原样输出
   local method="$1" path="$2" body="${3:-}"
-  local args=(-X "$method" -H "Authorization: Bearer $(ebk_token)")
+  local token
+  token="$(ebk_app_token)"
+  [[ -n "$token" ]] || { echo "核心收存的插件密钥里没有 mcp_token" >&2; return 1; }
+  local args=(-X "$method" -H "Authorization: Bearer $token")
   [[ -n "$body" ]] && args+=(-H 'Content-Type: application/json' -d "$body")
   curl_t "$SMOKE_API_MAX_TIME" "$SMOKE_WEB_ORIGIN$path" --noproxy '*' "${args[@]}"
 }
@@ -71,12 +62,15 @@ identity_check() { # 应用自己的"当前用户"接口：认出的是主人（
     { echo "应用没认出用户 $SMOKE_OWNER：$(head -c 200 <<<"$me")"; return 1; }
 }
 
-mcp_check() { # 自己核对：tools/list 里找本插件工具（名字打印进日志便于对号），再真实调用只读工具
-  local tool="net-mayswind-ezbookkeeping__query_all_accounts" names ann out
-  names="$(jq -r '.[].name' "$SMOKE_TOOLS" | grep '^net-mayswind-ezbookkeeping__' | tr '\n' ' ')"
-  echo "本插件工具：$names"
-  ann="$(jq -r --arg t "$tool" '.[] | select(.name == $t) | .annotations.readOnlyHint // "missing"' "$SMOKE_TOOLS")"
-  echo "readOnlyHint=$ann"
+mcp_check() { # 自己核对：tools/list 里找本插件工具，再真实调用只读工具。注解在总线上看不到（missing）时
+  # 核心把只读工具当非只读走确认，CI 里没有已配对设备应不了确认——这不是探针能修的，把证据打全交负责人。
+  local tool="net-mayswind-ezbookkeeping__query_all_accounts" ann out
+  ann="$(jq -r --arg t "$tool" '.[] | select(.name == $t) | (.annotations.readOnlyHint // "missing")' "$SMOKE_TOOLS")"
+  echo "readOnlyHint=$ann（上游 mcp_container.go 设了 true；总线上 missing=注解没透传）"
+  if [[ "$ann" != true ]]; then
+    echo "底座问题：总线的 tools/list 不带 annotations，只读工具被核心按非只读要求确认" >&2
+    return 1
+  fi
   out="$(mcp call "$SMOKE_MCP_URL" "$tool" '{}')" || { echo "调用 $tool 失败：$(head -c 200 <<<"$out")"; return 1; }
   [[ -n "$out" ]] || { echo "工具调用没有应答"; return 1; }
   jq -e '(.isError // false) == false' <<<"$out" >/dev/null ||
