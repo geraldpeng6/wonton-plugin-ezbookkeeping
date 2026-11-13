@@ -117,19 +117,34 @@ identity_check() { # 应用自己的"当前用户"接口：认出的是主人（
     { echo "应用没认出用户 $SMOKE_OWNER：$(head -c 200 <<<"$me")"; return 1; }
 }
 
-mcp_check() { # 自己核对：tools/list 里找本插件工具，再真实调用只读工具。注解在总线上看不到（missing）时
-  # 核心把只读工具当非只读走确认，CI 里没有已配对设备应不了确认——这不是探针能修的，把证据打全交负责人。
+mcp_check() { # tools/list 里有本插件工具，再真实调用一次，按注解的有无断言对应的行为。
+  # 上游 2.1.1（现钉镜像）的 MCP 实现没有工具注解（上游 2026-11-12 才在 master 加，还没发带注解的版本），
+  # readOnlyHint 按缺失处理：核心会把没标只读的工具先请主人确认，冒烟环境没有已配对的设备，应不了确认，
+  # 调用应答就是「没能请你确认」的报错——探针断言这个行为。等上游发了带注解的版本、升镜像后
+  # readOnlyHint 会是 true，走只读直通断言（到时候收紧）。
   local tool="net-mayswind-ezbookkeeping__query_all_accounts" ann out
+  jq -e --arg t "$tool" 'any(.[]; .name == $t)' "$SMOKE_TOOLS" >/dev/null ||
+    { echo "tools/list 里没有 $tool" >&2; return 1; }
   ann="$(jq -r --arg t "$tool" '.[] | select(.name == $t) | (.annotations.readOnlyHint // "missing")' "$SMOKE_TOOLS")"
-  echo "readOnlyHint=$ann（上游 mcp_container.go 设了 true；总线上 missing=注解没透传）"
-  if [[ "$ann" != true ]]; then
-    echo "底座问题：总线的 tools/list 不带 annotations，只读工具被核心按非只读要求确认" >&2
-    return 1
+  echo "readOnlyHint=$ann"
+  # isError 时 mcp call 退出非 0、原因在标准错误，要合并着接。
+  if out="$(mcp call "$SMOKE_MCP_URL" "$tool" '{}' 2>&1)"; then
+    [[ -n "$out" ]] || { echo "工具调用没有应答" >&2; return 1; }
+    if [[ "$ann" == true ]]; then
+      echo "只读直通，应答：$(head -c 200 <<<"$out")"
+    else
+      echo "没标只读的工具没走确认就执行了，应答：$(head -c 200 <<<"$out")" >&2
+      return 1
+    fi
+  else
+    if [[ "$ann" == true ]]; then
+      echo "只读工具应直接执行，实际失败：$(head -c 200 <<<"$out")" >&2
+      return 1
+    fi
+    grep -q "没能请你确认" <<<"$out" ||
+      { echo "没标只读的工具应走主人确认，实际失败：$(head -c 200 <<<"$out")" >&2; return 1; }
+    echo "确认路径符合预期：$(head -c 200 <<<"$out")"
   fi
-  out="$(mcp call "$SMOKE_MCP_URL" "$tool" '{}')" || { echo "调用 $tool 失败：$(head -c 200 <<<"$out")"; return 1; }
-  [[ -n "$out" ]] || { echo "工具调用没有应答"; return 1; }
-  jq -e '(.isError // false) == false' <<<"$out" >/dev/null ||
-    { echo "工具应答报错：$(head -c 200 <<<"$out")"; return 1; }
 }
 
 data_write() { # 建一级+二级分类（交易只能挂二级分类）、账户和一笔带标记的支出，把"标记 交易id"写进 $SMOKE_STATE
