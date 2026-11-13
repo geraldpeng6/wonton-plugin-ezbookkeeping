@@ -36,7 +36,7 @@ EBK_ID="net.mayswind.ezbookkeeping"
 
 ebk_owner_password() { # 核心收存的插件密钥（data/core/plugins/secrets/<插件id>.json）里有初始密码
   docker exec "wonton-$SMOKE_INSTANCE--core" cat "$SMOKE_DATA_DIR/core/plugins/secrets/$EBK_ID.json" 2>/dev/null |
-    jq -r '(.values.owner_password // .owner_password // empty)'
+    jq -r '(.values.owner_password // .owner_password // empty)' | base64 -d
 }
 
 ebk_token() { # 应用会话令牌：authorize.json，字段是 loginName（不是 username）。错误走 stderr，别被命令替换吞掉
@@ -71,14 +71,13 @@ identity_check() { # 应用自己的"当前用户"接口：认出的是主人（
     { echo "应用没认出用户 $SMOKE_OWNER：$(head -c 200 <<<"$me")"; return 1; }
 }
 
-# shellcheck disable=SC2034 # probes.sh 按名字读
-MCP_TOOL="net-mayswind-ezbookkeeping__query_all_accounts"
-# shellcheck disable=SC2034 # probes.sh 按名字读
-MCP_ARGS='{}'
-
-mcp_assert() { # 只读工具：应答不是错误就算通（新装实例账本为空是正常状态）
-  local out
-  out="$(cat)"
+mcp_check() { # 自己核对：tools/list 里找本插件工具（名字打印进日志便于对号），再真实调用只读工具
+  local tool="net-mayswind-ezbookkeeping__query_all_accounts" names ann out
+  names="$(jq -r '.[].name' "$SMOKE_TOOLS" | grep '^net-mayswind-ezbookkeeping__' | tr '\n' ' ')"
+  echo "本插件工具：$names"
+  ann="$(jq -r --arg t "$tool" '.[] | select(.name == $t) | .annotations.readOnlyHint // "missing"' "$SMOKE_TOOLS")"
+  echo "readOnlyHint=$ann"
+  out="$(mcp call "$SMOKE_MCP_URL" "$tool" '{}')" || { echo "调用 $tool 失败：$(head -c 200 <<<"$out")"; return 1; }
   [[ -n "$out" ]] || { echo "工具调用没有应答"; return 1; }
   jq -e '(.isError // false) == false' <<<"$out" >/dev/null ||
     { echo "工具应答报错：$(head -c 200 <<<"$out")"; return 1; }
