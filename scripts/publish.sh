@@ -39,7 +39,8 @@ release_notes() {
 }
 
 # Dependabot 的升级 PR 只改镜像，version 和 release_notes 攒到发版时一起改：少改一样就停下提示，不自动编。
-last_tag="$(git tag -l 'v*' --sort=-v:refname | head -1)"
+# 不含正在发的 tag：首版发版时它自己就是列表里最新的一个，拿它当「上一个」会把 release_notes 跟自己比。
+last_tag="$(git tag -l 'v*' --sort=-v:refname | grep -vx -- "$tag" | head -1 || true)"
 if [[ -n "$last_tag" ]]; then
   [[ "$(printf '%s\n%s\n' "$tag" "$last_tag" | sort -V | tail -1)" == "$tag" ]] ||
     die "version $version 不比上一个 tag $last_tag 新：发版前把清单的 version 改成新版本"
